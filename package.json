@@ -1,0 +1,21 @@
+{
+  "name": "whatsapp-crm",
+  "private": true,
+  "version": "0.1.0",
+  "description": "WhatsApp CRM — contactos, conversaciones, pipeline y notas con Twilio + Supabase.",
+  "packageManager": "pnpm@11.22.0",
+  "engines": {
+    "node": ">=18.18.0"
+  },
+  "scripts": {
+    "dev": "pnpm -r --parallel --stream dev",
+    "dev:api": "pnpm --filter @crm/api dev",
+    "dev:web": "pnpm --filter @crm/web dev",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "clean": "pnpm -r exec rm -rf dist .turbo node_modules .vite"
+  },
+  "devDependencies": {
+    "typescript": "5.6.3"
+  }
+}

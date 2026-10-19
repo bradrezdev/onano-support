@@ -1,0 +1,16 @@
+.main {
+  max-width: 640px;
+  margin: 4rem auto;
+  padding: 1rem 2rem;
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  line-height: 1.5;
+}
+.main h1 {
+  font-size: 1.5rem;
+  margin: 0 0 0.5rem;
+}
+.main code {
+  background: #f3f4f6;
+  padding: 0.1rem 0.4rem;
+  border-radius: 4px;
+}
