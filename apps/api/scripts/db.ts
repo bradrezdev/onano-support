@@ -68,16 +68,48 @@ async function cmdMigrate(): Promise<void> {
   }
   console.log(`Applying ${files.length} migrations from ${dir}\n`)
   await withClient(async (c) => {
+    // Track applied migrations in a small table so re-runs are safe and
+    // idempotent regardless of which IF NOT EXISTS guards each file ships.
+    await c.query(`
+      create table if not exists public.schema_migrations (
+        filename text primary key,
+        applied_at timestamptz not null default now()
+      )
+    `)
+
+    const { rows: applied } = await c.query<{ filename: string }>(
+      `select filename from public.schema_migrations`,
+    )
+    const appliedSet = new Set(applied.map((r) => r.filename))
+
     for (const f of files) {
+      if (appliedSet.has(f)) {
+        console.log(`> ${f} ... skip (recorded in schema_migrations)`)
+        continue
+      }
       const sql = readFileSync(join(dir, f), 'utf8')
       process.stdout.write(`> ${f} ... `)
       try {
+        await c.query('begin')
         await c.query(sql)
+        await c.query(
+          `insert into public.schema_migrations (filename) values ($1) on conflict do nothing`,
+          [f],
+        )
+        await c.query('commit')
         console.log('ok')
       } catch (err) {
+        await c.query('rollback').catch(() => undefined)
         const msg = (err as Error).message
-        // Tolerate idempotent re-runs: skip if it's an "already exists" error.
+        // Tolerate idempotent re-runs even without schema_migrations seed:
+        // skip if it's an "already exists" error and still record it.
         if (/already exists|duplicate/i.test(msg)) {
+          await c
+            .query(
+              `insert into public.schema_migrations (filename) values ($1) on conflict do nothing`,
+              [f],
+            )
+            .catch(() => undefined)
           console.log('skip (already applied)')
           continue
         }
