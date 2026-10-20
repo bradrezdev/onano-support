@@ -56,9 +56,10 @@ function walk(n: unknown): TipTapNode[] {
   if (!ALLOWED_NODES.has(node.type ?? '')) return []
 
   if (node.type === 'text') {
-    const marks = Array.isArray(node.marks)
+    const filteredMarks = Array.isArray(node.marks)
       ? node.marks.filter((m) => ALLOWED_MARKS.has(m.type ?? '')).map((m) => ({ type: m.type }))
-      : undefined
+      : []
+    const marks = filteredMarks.length > 0 ? filteredMarks : undefined
     return [{ type: 'text', text: typeof node.text === 'string' ? node.text : '', ...(marks ? { marks } : {}) }]
   }
 

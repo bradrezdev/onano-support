@@ -247,3 +247,51 @@
 - **L14** (this turn, T8 frontend) — Built ThemesPage (grid of theme cards with flows preview chips + edit modal with color picker) and FlowEditorPage (dnd-kit sortable with PointerSensor + KeyboardSensor for accessibility). Wired Sidebar entry under "Admin" role and `RoleGuard` mount. `pnpm typecheck` + `pnpm build` clean. Vite dev server returns 200 on `/themes` and `/themes/:id`. T8 fully done.
 - **L15** (this turn, T9) — PipelinePage with themes as rows, flows as columns, tickets as draggable cards using dnd-kit `PointerSensor` + `KeyboardSensor` and a `DragOverlay`. Move POSTs `/api/tickets/:id/flow` with optimistic update + rollback on failure. Mounted at `/pipeline` (auth required). T9 done.
 - **L16** (this turn, T10) — Built `/api/users` (list + `?q=` search), `/api/users/:id` (with open/closed/total counts), and `/api/tickets/search?q=` (matches ticket.name OR contact email/name/country via FK join). Frontend: UsersPage + UserDetailPage + search bar on TicketsPage. Smoke tested with 4 curl probes. T10 done.
+
+### T15 — Test infrastructure (vitest + jsdom) — DONE
+**Route**: inline
+**Risk**: 3, 7 (test framework misconfig; env mismatch between Vite 8 + TS 6)
+**Risk line**: `Risk: 3, 7 (vitest 2.x chosen over 3.x for TS 6 / Vite 8 compat; jsdom for browser-side env)`
+**Acceptance met**: `pnpm test` runs both apps; 134 tests pass; `pnpm typecheck` passes alongside.
+**Evidence**:
+- `apps/api/vitest.config.ts` (NEW) — `@/*` alias resolved from `tsconfig.json` paths; environment=node; include=`src/**/*.test.ts`.
+- `apps/web/vitest.config.ts` (NEW) — `@/*` alias + `@vitejs/plugin-react`; environment=jsdom; setupFiles=`./vitest.setup.ts`.
+- `apps/web/vitest.setup.ts` (NEW) — provides `structuredClone` polyfill for jsdom.
+- `apps/api/package.json` — added `test` + `test:watch` scripts (`vitest run` / `vitest`).
+- `apps/web/package.json` — same.
+- Root `package.json` — added `test` + `test:watch` running `pnpm -r test`.
+- Devdeps installed: `vitest@^2.1.9`, `jsdom@^30.1.3`, `@testing-library/react@^16.3.3`, `@vitest/coverage-v8@^2.1.9`.
+
+### T16 — TDD retro on backend utilities + services — DONE
+**Route**: inline (test-after for T1-T14 code; test-first required for any new file going forward)
+**Risk**: 5 (mock surface mismatch), 7 (Promise.all requires 2+ mockReturnValueOnce), 10 (false positives — test asserts bug as feature)
+**Risk line**: `Risk: 5, 7, 10 (Supabase JS mock patterns; parallel-query test scaffolding; resisting the urge to "fix" tests to match wrong code)`
+**Acceptance met**: 109 api tests covering 5 lib files + 4 services; one real bug found and fixed.
+**Evidence**:
+- 13 tests `sanitize.test.ts` — uncovered bug: when ALL marks are filtered out, code emitted `marks: []` instead of dropping the key. Fix is to add an explicit length check before the spread.
+- 9 tests `phone.test.ts` — normalizePhone E.164 + isLikelyWhatsapp 8-15 digit window.
+- 9 tests `twilio-signature.test.ts` — full coverage including TWILIO_AUTH_TOKEN undefined dev-mode, sort-order invariant (POST keys alphabetized before signing), length-mismatch short-circuit.
+- 10 tests `validate.test.ts` — parseJson success / invalid_json / validation_failed with details; getQuery coercion + multi-value precedence.
+- 13 tests `services/ticket-messages.test.ts` — sanitize → empty_body; ticket_not_found; ticket_closed (409, `status: 'closed'`); fade_step auto-increment with cap at 9; role_color upsert validation (#RRGGBB + 1≤N≤10).
+- 14 tests `services/users.test.ts` — self_suspend guard; self_demote blocks all self-role-changes away from admin (confirmed design intent); deleted-user guard; suspend/reactivate transitions; display_name trim; searchUsers empty-query + deleted-excluded.
+- 13 tests `services/conversation-links.test.ts` — list flattens Supabase embedded selects (`tickets[0]`); linkTicket validates both ticket + conversation in parallel with `Promise.all` (two from() calls required); unlink {removed: boolean} shape.
+- 13 tests `services/conversations.test.ts` — E.164 normalization in findContactByWhatsappNumber; findOrCreateConversationForContact hot path; appendInboundMessage idempotency (`onConflict: 'twilio_sid', ignoreDuplicates: true`); appendOutboundMessage twilio_status null vs queued; updateMessageStatusBySid reports updated flag.
+- 15 tests `services/themes.test.ts` — listThemesWithFlows groups by theme_id; createTheme position from count + duplicate 23505 → 409; deleteFlow refuses when tickets reference flow; reorderFlows parallel updates.
+
+### T17 — TDD retro on frontend utilities — DONE
+**Route**: inline
+**Risk**: 3 (jsdom + React 19 + react-router-dom v6 + zustand v5 combinations not all greenfield; some component tests need @testing-library/react render)
+**Risk line**: `Risk: 3 (jsdom reactivity for DOM-bound utilities; some pages still untested for async state)`
+**Acceptance met**: 25 web tests covering 3 utility modules.
+**Evidence**:
+- 9 tests `permissions.test.ts` — full role × action matrix; admin = all; supervisor cannot close/reopen; soporte = minimal.
+- 7 tests `conversations.test.ts` — previewSnippet null/empty placeholder, whitespace collapse, ellipsis truncation at 80.
+- 9 tests `roleColors.test.ts` — bubbleStyle white% formula (step × 12, capped 88); borderColor = whitePct - 20 floored at 0; loadRoleColors caches in module state; :root CSS custom property update; warn-and-fallback when fetch fails.
+
+---
+
+## Log (continued)
+
+- **L17** (this turn, T15) — `CI=true pnpm add -D` required to avoid `ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY`; vitest 2.1.9 chosen (not 3.x) for Vite 8 / TS 6 compat in web. jsdom 30 for the web env.
+- **L18** (this turn, T16) — First mock attempt used Proxy recursion — deadlocked. Replaced with plain class chainable (`QueryMock` with `then()` makes `.select(...).eq(...)` awaitable without terminal). Per-service mock imports `@/lib/supabase/admin` lazily after `vi.mock` so the export binds to the stub. Two real cycles of red-green: `sanitize.ts` empty-marks bug (caught by test), `previewSnippet('')` test expectation was wrong (UX is placeholder, not empty).
+- **L19** (this turn, T17) — `roleColors.test.ts` uses `// @vitest-environment jsdom` pragma as a belt-and-suspenders alongside the config, in case setup runs without env loaded.
