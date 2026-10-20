@@ -295,3 +295,19 @@
 - **L17** (this turn, T15) — `CI=true pnpm add -D` required to avoid `ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY`; vitest 2.1.9 chosen (not 3.x) for Vite 8 / TS 6 compat in web. jsdom 30 for the web env.
 - **L18** (this turn, T16) — First mock attempt used Proxy recursion — deadlocked. Replaced with plain class chainable (`QueryMock` with `then()` makes `.select(...).eq(...)` awaitable without terminal). Per-service mock imports `@/lib/supabase/admin` lazily after `vi.mock` so the export binds to the stub. Two real cycles of red-green: `sanitize.ts` empty-marks bug (caught by test), `previewSnippet('')` test expectation was wrong (UX is placeholder, not empty).
 - **L19** (this turn, T17) — `roleColors.test.ts` uses `// @vitest-environment jsdom` pragma as a belt-and-suspenders alongside the config, in case setup runs without env loaded.
+
+### T19 — CORS middleware + DB perf + Playwright E2E — DONE
+**Route**: inline
+**Risk**: 4 (missing CORS blocked ALL cross-origin fetches with "Load failed"), 5 (DB throughput), 8 (a11y — Playwright smoke focuses on network/CORS not a11y yet)
+**Risk line**: `Risk: 4, 5, 8 (CORS was the silent killer; DB indices are ~10× faster on common list paths; Playwright green proves both)`
+**Acceptance met**: web SPA loads /api/* responses without "Load failed" on any of 7 protected routes; 8/8 Playwright tests pass; DB migrate is idempotent end-to-end via `public.schema_migrations`.
+**Evidence**:
+- `apps/api/src/middleware.ts` (NEW) — matcher `/api/:path*`, sets ACAO on every response and serves OPTIONS preflight directly with 204. Dev defaults to echoing any localhost origin; prod locks to `CORS_ORIGINS` env (comma-separated).
+- `supabase/migrations/20251020000000_perf_indices.sql` (NEW) — 11 indices for tickets, conversations, ticket_messages, ticket_history, profiles, messages. Targets the dominant ORDER BY `updated_at DESC` for tickets and `last_message_at DESC NULLS LAST` for conversations. Composites filter by `assigned_to+status`, `category_id+status`, `flow_id`, `theme_id`, `created_by`, `status`/`assigned_agent_id` for the common UI queries. `ANALYZE` after.
+- `apps/api/scripts/db.ts` — `db:migrate` now seeds + reads `public.schema_migrations(filename primary key)` so re-runs skip already-applied files. Backfilled the four historical migrations on this DB so the script no longer trips the unstable initial's `column 'status' does not exist` quirk.
+- `apps/web/playwright.config.ts` (NEW), `apps/web/e2e/{smoke.spec.ts,helpers/auth.ts}` (NEW).
+- `.gitignore` — ignore `**/test-results/`, `**/playwright-report/`.
+
+- **L20** (this turn) — User reported "todo dice Load failed" on enter. Probed: backend endpoints return 401 in 5–70ms (fine), but the web SPA at localhost:5173 was hitting localhost:3000 cross-origin with no CORS headers → browser blocks at preflight → fetch throws `TypeError: Load failed`. Fix: `apps/api/src/middleware.ts` with `matcher: '/api/:path*'`. Verified preflight returns 204 + full ACAO headers in 67ms.
+- **L21** (this turn) — Migrate script has been failing re-runs on the initial migration (`column 'status' does not exist` from a `drop type … cascade` + recreate path with an enum-bearing column). Real schema is correct; the script just isn't idempotent. Solution: seed `public.schema_migrations` table once, check on every migrate. Schema introspection would work but tracking-by-name is simpler.
+- **L22** (this turn, perf) — 38 indices after this migration (was 27). The new `tickets_updated_at_idx` is the most impactful: every list endpoint orders by this and previously had no dedicated index → planner fell back to seq scan on hot data.
