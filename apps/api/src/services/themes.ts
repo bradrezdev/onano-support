@@ -18,12 +18,23 @@ export interface Flow {
   description: string | null
   position: number
   is_terminal: boolean
+  /** Recommendation 5: which shared group this phase belongs to. */
+  group_key: string | null
   created_at: string
   updated_at: string
 }
 
+/** Recommendation 5: the fixed shared vocabulary every project's phases map onto. */
+export interface FlowGroup {
+  key: string
+  label: string
+  position: number
+  color: string
+}
+
 export interface ThemeWithFlows extends Theme {
   flows: Flow[]
+  groups: FlowGroup[]
 }
 
 export class ThemeError extends Error {
@@ -38,12 +49,22 @@ export class ThemeError extends Error {
 
 export async function listThemesWithFlows(): Promise<ThemeWithFlows[]> {
   const admin = createSupabaseAdminClient()
-  const [{ data: themes, error: tErr }, { data: flows, error: fErr }] = await Promise.all([
+  const [
+    { data: themes, error: tErr },
+    { data: flows, error: fErr },
+    { data: groups, error: gErr },
+  ] = await Promise.all([
     admin.from('themes').select('*').order('position', { ascending: true }),
     admin.from('flows').select('*').order('position', { ascending: true }),
+    admin.from('flow_groups').select('key, label, position, color').order('position', { ascending: true }),
   ])
   if (tErr) throw tErr
   if (fErr) throw fErr
+  if (gErr) throw gErr
+
+  // The group vocabulary is the same four entries for every project, so it
+  // travels with the payload rather than costing another request per theme.
+  const sharedGroups = (groups ?? []) as unknown as FlowGroup[]
 
   const byTheme = new Map<string, Flow[]>()
   for (const f of (flows ?? []) as unknown as Flow[]) {
@@ -51,7 +72,11 @@ export async function listThemesWithFlows(): Promise<ThemeWithFlows[]> {
     list.push(f)
     byTheme.set(f.theme_id, list)
   }
-  return ((themes ?? []) as unknown as Theme[]).map((t) => ({ ...t, flows: byTheme.get(t.id) ?? [] }))
+  return ((themes ?? []) as unknown as Theme[]).map((t) => ({
+    ...t,
+    flows: byTheme.get(t.id) ?? [],
+    groups: sharedGroups,
+  }))
 }
 
 export async function findThemeOrThrow(id: string): Promise<Theme> {
@@ -172,13 +197,20 @@ export async function createFlow(
 
 export async function updateFlow(
   id: string,
-  patch: { name?: string; description?: string | null; is_terminal?: boolean },
+  patch: {
+    name?: string
+    description?: string | null
+    is_terminal?: boolean
+    /** Recommendation 5: file this phase into the shared vocabulary. */
+    group_key?: string | null
+  },
 ): Promise<Flow> {
   const admin = createSupabaseAdminClient()
   const update: Record<string, unknown> = {}
   if (patch.name !== undefined) update.name = patch.name.trim()
   if (patch.description !== undefined) update.description = patch.description?.trim() || null
   if (patch.is_terminal !== undefined) update.is_terminal = patch.is_terminal
+  if (patch.group_key !== undefined) update.group_key = patch.group_key
   const { data, error } = await admin
     .from('flows')
     .update(update)

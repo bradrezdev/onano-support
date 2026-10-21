@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { z } from 'zod'
-import { requireRole } from '@/lib/auth'
+import { requirePermission } from '@/lib/auth'
 import { parseJson } from '@/lib/validate'
 import {
   createTicketMessage,
@@ -16,7 +16,7 @@ const CreateMessage = z.object({
 })
 
 export async function GET(request: Request, ctx: Params) {
-  const auth = await requireRole(['admin', 'supervisor', 'soporte'], request)
+  const auth = await requirePermission(['ticket.read'], request)
   if ('error' in auth) return auth.error
   const { id } = await ctx.params
 
@@ -46,7 +46,7 @@ export async function GET(request: Request, ctx: Params) {
 }
 
 export async function POST(request: Request, ctx: Params) {
-  const auth = await requireRole(['admin', 'supervisor', 'soporte'], request)
+  const auth = await requirePermission(['ticket.reply'], request)
   if ('error' in auth) return auth.error
   const { id } = await ctx.params
 

@@ -75,12 +75,26 @@ describe('listThemesWithFlows', () => {
       ],
       error: null,
     }
-    mockAdmin.from.mockReturnValueOnce(themesQ).mockReturnValueOnce(flowsQ)
+    const groupsQ = new QueryMock()
+    groupsQ.payload = {
+      data: [
+        { key: 'pendiente', label: 'Pendiente', position: 1, color: '#94a3b8' },
+        { key: 'en_trabajo', label: 'En trabajo', position: 2, color: '#3b82f6' },
+        { key: 'en_espera', label: 'En espera', position: 3, color: '#f59e0b' },
+        { key: 'terminado', label: 'Terminado', position: 4, color: '#22c55e' },
+      ],
+      error: null,
+    }
+    mockAdmin.from
+      .mockReturnValueOnce(themesQ)
+      .mockReturnValueOnce(flowsQ)
+      .mockReturnValueOnce(groupsQ)
 
     const out = await themes.listThemesWithFlows()
     expect(out.length).toBe(2)
     expect(out[0]!.flows.map((f) => f.name)).toEqual(['Nuevo', 'Listo'])
     expect(out[1]!.flows.map((f) => f.name)).toEqual(['Pendiente'])
+    expect(out[0]!.groups.map((g) => g.key)).toEqual(['pendiente', 'en_trabajo', 'en_espera', 'terminado'])
   })
 
   it('returns empty flows array when a theme has none', async () => {
@@ -88,7 +102,12 @@ describe('listThemesWithFlows', () => {
     themesQ.payload = { data: [{ id: 't-1', name: 'X', description: null, color: '#000', position: 0, created_by: 'u-1', created_at: 'x', updated_at: 'x' }], error: null }
     const flowsQ = new QueryMock()
     flowsQ.payload = { data: [], error: null }
-    mockAdmin.from.mockReturnValueOnce(themesQ).mockReturnValueOnce(flowsQ)
+    const groupsQ = new QueryMock()
+    groupsQ.payload = { data: [], error: null }
+    mockAdmin.from
+      .mockReturnValueOnce(themesQ)
+      .mockReturnValueOnce(flowsQ)
+      .mockReturnValueOnce(groupsQ)
     const out = await themes.listThemesWithFlows()
     expect(out[0]!.flows).toEqual([])
   })

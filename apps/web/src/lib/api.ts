@@ -21,6 +21,9 @@ export class ApiError extends Error {
 
 const BASE = (import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000').replace(/\/$/, '')
 
+/** Exported so the auth store can reach /api/me before apiFetch is usable. */
+export const API_BASE_URL = BASE
+
 async function authHeader(): Promise<Record<string, string>> {
   const session = await getSession()
   return session?.access_token ? { Authorization: `Bearer ${session.access_token}` } : {}
@@ -68,6 +71,7 @@ export async function apiFetch<T>(
 export const api = {
   get: <T>(path: string) => apiFetch<T>(path),
   post: <T>(path: string, json?: unknown) => apiFetch<T>(path, { method: 'POST', json }),
+  put: <T>(path: string, json?: unknown) => apiFetch<T>(path, { method: 'PUT', json }),
   patch: <T>(path: string, json?: unknown) => apiFetch<T>(path, { method: 'PATCH', json }),
   del: <T>(path: string) => apiFetch<T>(path, { method: 'DELETE' }),
 }

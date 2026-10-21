@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { z } from 'zod'
-import { requireRole } from '@/lib/auth'
+import { requirePermission } from '@/lib/auth'
 import { parseJson } from '@/lib/validate'
 import {
   listRoleColors,
@@ -15,7 +15,7 @@ const ColorPut = z.object({
 })
 
 export async function GET(request: Request) {
-  const auth = await requireRole(['admin', 'supervisor', 'soporte'], request)
+  const auth = await requirePermission(['conversation.read'], request)
   if ('error' in auth) return auth.error
   try {
     const data = await listRoleColors()
@@ -29,7 +29,7 @@ export async function GET(request: Request) {
 }
 
 export async function PUT(request: Request) {
-  const auth = await requireRole(['admin'], request)
+  const auth = await requirePermission(['admin.manageRoles'], request)
   if ('error' in auth) return auth.error
   // body carries { role, base_color, fade_steps }
   const BodyWithRole = ColorPut.extend({ role: Role })

@@ -17,6 +17,8 @@ class QueryMock {
   }
   select(...args: unknown[]) { return this.record('select', args) }
   eq(col: string, val: unknown) { return this.record('eq', [col, val]) }
+  is(col: string, val: unknown) { return this.record('is', [col, val]) }
+  not(col: string, op: string, val: unknown) { return this.record('not', [col, op, val]) }
   insert(rows: unknown) { return this.record('insert', [rows]) }
   update(rows: unknown) { return this.record('update', [rows]) }
   delete() { return this }

@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { z } from 'zod'
-import { requireRole } from '@/lib/auth'
+import { requireUser, requirePermission } from '@/lib/auth'
+import type { Permission } from '@/lib/permissions'
 import { parseJson } from '@/lib/validate'
 import {
   findUserOrThrow,
@@ -12,13 +13,14 @@ import {
 type Params = { params: Promise<{ id: string }> }
 
 const UserPatchBody = z.object({
-  role: z.enum(['admin', 'supervisor', 'soporte']).optional(),
+  /** Any slug from public.roles — shipped or custom (R2). */
+  role: z.string().min(1).max(31).regex(/^[a-z][a-z0-9_]*$/).optional(),
   suspend: z.boolean().optional(),
   display_name: z.string().min(0).max(120).optional(),
 })
 
 export async function GET(request: Request, ctx: Params) {
-  const auth = await requireRole(['admin', 'supervisor'], request)
+  const auth = await requirePermission(['admin.viewAccounts'], request)
   if ('error' in auth) return auth.error
   const { id } = await ctx.params
 
@@ -44,12 +46,34 @@ export async function GET(request: Request, ctx: Params) {
 }
 
 export async function PATCH(request: Request, ctx: Params) {
-  const auth = await requireRole(['admin'], request)
+  const auth = await requireUser(request)
   if ('error' in auth) return auth.error
   const { id } = await ctx.params
 
   const parsed = await parseJson(request, UserPatchBody)
   if ('error' in parsed) return parsed.error
+
+  // The patch can change a role, suspend someone, or both — and those are
+  // separate powers. Requiring the union would let someone with only
+  // `admin.suspendUser` also rewrite roles. Require exactly what was asked.
+  const needed: Permission[] = []
+  if (parsed.data.role !== undefined) needed.push('admin.assignRole')
+  if (parsed.data.suspend !== undefined) needed.push('admin.suspendUser')
+  if (needed.length === 0) needed.push('admin.assignRole')
+
+  const held = auth.user.permissions
+  const denied = needed.filter((p) => !held.includes(p))
+  if (denied.length > 0) {
+    return NextResponse.json(
+      {
+        code: 'forbidden',
+        error: 'forbidden',
+        message: `Requires permission: ${denied.join(', ')}`,
+        required: denied,
+      },
+      { status: 403 },
+    )
+  }
 
   try {
     const updated = await updateUser(id, parsed.data, auth.user.id)

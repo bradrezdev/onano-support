@@ -47,7 +47,7 @@ export default function FlowEditorPage() {
       )
       const found = res.data.find((t) => t.id === id)
       if (!found) {
-        setError('Tema no encontrado.')
+        setError('Proyecto no encontrado.')
         setTheme(null)
         setFlows([])
         return
@@ -114,7 +114,7 @@ export default function FlowEditorPage() {
             type="button"
             onClick={() => navigate('/themes')}
             className="btn-ghost p-2"
-            aria-label="Volver a temas"
+            aria-label="Volver a proyectos"
           >
             <ArrowLeft size={16} />
           </button>
@@ -153,7 +153,7 @@ export default function FlowEditorPage() {
         <div className="card p-6 text-sm text-slate-500">Cargando…</div>
       ) : flows.length === 0 ? (
         <div className="card flex flex-col items-center gap-2 p-8 text-center text-sm text-slate-500">
-          <p>Aún no hay flujos para este tema.</p>
+          <p>Aún no hay fases para este proyecto.</p>
           {isAdmin && (
             <button
               type="button"
@@ -199,7 +199,7 @@ export default function FlowEditorPage() {
       {theme && theme.flows.length === 0 && (
         <p className="text-center text-xs text-slate-400">
           <RouterLink to="/themes" className="underline">
-            Volver al listado de temas
+            Volver al listado de proyectos
           </RouterLink>
         </p>
       )}

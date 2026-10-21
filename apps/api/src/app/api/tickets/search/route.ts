@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { requireRole } from '@/lib/auth'
+import { requirePermission } from '@/lib/auth'
 import { getQuery } from '@/lib/validate'
 import { createSupabaseAdminClient } from '@/lib/supabase/admin'
 
@@ -19,7 +19,7 @@ interface TicketSearchHit {
 }
 
 export async function GET(request: Request) {
-  const auth = await requireRole(['admin', 'supervisor', 'soporte'], request)
+  const auth = await requirePermission(['ticket.read'], request)
   if ('error' in auth) return auth.error
 
   const q = getQuery<{ q?: string; limit?: number }>(request, {

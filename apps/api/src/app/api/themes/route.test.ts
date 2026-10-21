@@ -6,7 +6,8 @@ const mockCreateTheme = vi.fn()
 
 vi.mock('@/lib/auth', () => ({
   requireUser: vi.fn(),
-  requireRole: (...args: unknown[]) => mockRequireRole(...args),
+    requirePermission: (...args: unknown[]) => mockRequireRole(...args),
+  requireAllPermissions: (...args: unknown[]) => mockRequireRole(...args),requireRole: (...args: unknown[]) => mockRequireRole(...args),
   getCurrentUser: vi.fn(),
 }))
 

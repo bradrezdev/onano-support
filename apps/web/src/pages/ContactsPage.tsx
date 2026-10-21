@@ -52,7 +52,7 @@ export default function ContactsPage() {
     <div className="space-y-4">
       <header className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-semibold text-slate-900">Contactos</h1>
+          <h1 className="text-2xl font-semibold text-slate-900">Clientes</h1>
           <p className="mt-1 text-sm text-slate-500">
             Personas que contactan por WhatsApp. Se pueden asignar a tickets.
           </p>
@@ -64,7 +64,7 @@ export default function ContactsPage() {
             onClick={() => setFormOpen(true)}
           >
             <Plus size={16} />
-            Nuevo contacto
+            Nuevo cliente
           </button>
         )}
       </header>
@@ -98,7 +98,7 @@ export default function ContactsPage() {
         <div className="card p-6 text-sm text-slate-500">Cargando…</div>
       ) : contacts.length === 0 ? (
         <div className="card p-8 text-center text-sm text-slate-500">
-          {search.trim() ? 'Sin resultados.' : 'Aún no hay contactos.'}
+          {search.trim() ? 'Sin resultados.' : 'Aún no hay clientes.'}
         </div>
       ) : (
         <div className="card overflow-x-auto">
@@ -196,7 +196,7 @@ function ContactFormModal({
     >
       <div className="card w-full max-w-md p-6" onClick={(e) => e.stopPropagation()}>
         <div className="mb-3 flex items-center justify-between">
-          <h2 className="text-lg font-semibold text-slate-900">Nuevo contacto</h2>
+          <h2 className="text-lg font-semibold text-slate-900">Nuevo cliente</h2>
           <button type="button" className="btn-ghost px-2 py-1" onClick={onClose}>
             <X size={16} />
           </button>

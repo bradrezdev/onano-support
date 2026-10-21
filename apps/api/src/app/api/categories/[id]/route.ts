@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { z } from 'zod'
-import { requireRole } from '@/lib/auth'
+import { requirePermission } from '@/lib/auth'
 import { parseJson } from '@/lib/validate'
 import { createSupabaseAdminClient } from '@/lib/supabase/admin'
 import { categoryHasChildren, findCategoryById } from '@/services/categories'
@@ -13,7 +13,7 @@ const CategoryUpdate = z.object({
 type Params = { params: Promise<{ id: string }> }
 
 export async function PATCH(request: Request, ctx: Params) {
-  const auth = await requireRole(['admin'], request)
+  const auth = await requirePermission(['category.update'], request)
   if ('error' in auth) return auth.error
   const { id } = await ctx.params
 
@@ -56,7 +56,7 @@ export async function PATCH(request: Request, ctx: Params) {
 }
 
 export async function DELETE(request: Request, ctx: Params) {
-  const auth = await requireRole(['admin'], request)
+  const auth = await requirePermission(['category.delete'], request)
   if ('error' in auth) return auth.error
   const { id } = await ctx.params
 

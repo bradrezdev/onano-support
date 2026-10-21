@@ -157,7 +157,7 @@ export default function TicketsPage() {
                       <tr>
                         <th className="px-4 py-2 font-medium">Nombre</th>
                         <th className="px-4 py-2 font-medium">Estado</th>
-                        <th className="px-4 py-2 font-medium">Contacto</th>
+                        <th className="px-4 py-2 font-medium">Cliente</th>
                         <th className="px-4 py-2 font-medium">Actualizado</th>
                       </tr>
                     </thead>

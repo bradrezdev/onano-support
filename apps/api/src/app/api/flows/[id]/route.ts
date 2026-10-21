@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { z } from 'zod'
-import { requireRole } from '@/lib/auth'
+import { requirePermission } from '@/lib/auth'
 import { parseJson } from '@/lib/validate'
 import { updateFlow, deleteFlow, ThemeError } from '@/services/themes'
 
@@ -8,12 +8,14 @@ const FlowPatch = z.object({
   name: z.string().min(1).max(120).optional(),
   description: z.string().max(500).nullable().optional(),
   is_terminal: z.boolean().optional(),
+  // Recommendation 5: shared phase vocabulary.
+  group_key: z.enum(['pendiente', 'en_trabajo', 'en_espera', 'terminado']).nullable().optional(),
 })
 
 type Params = { params: Promise<{ id: string }> }
 
 export async function PATCH(request: Request, ctx: Params) {
-  const auth = await requireRole(['admin'], request)
+  const auth = await requirePermission(['flow.create'], request)
   if ('error' in auth) return auth.error
   const { id } = await ctx.params
 
@@ -38,7 +40,7 @@ export async function PATCH(request: Request, ctx: Params) {
 }
 
 export async function DELETE(request: Request, ctx: Params) {
-  const auth = await requireRole(['admin'], request)
+  const auth = await requirePermission(['flow.delete'], request)
   if ('error' in auth) return auth.error
   const { id } = await ctx.params
 

@@ -1,12 +1,20 @@
 import { create } from 'zustand'
 import type { Session, User } from '@supabase/supabase-js'
 import { supabase } from '@/lib/supabase'
-import type { Role } from '@/lib/permissions'
+import { API_BASE_URL } from '@/lib/api'
+import type { Role, Permission } from '@/lib/permissions'
 
 export interface Profile {
   id: string
   display_name: string | null
+  /** Self-set contact number from the profile page. */
+  phone: string | null
+  /** Legacy role, still one of the three shipped slugs. */
   role: Role
+  /** Source of truth: the slug of the role in public.roles (R2). */
+  role_key: string
+  /** Resolved keyring from /api/me. Authoritative for what the user may do. */
+  permissions: Permission[]
   avatar_url: string | null
   suspended_at?: string | null
   deleted_at?: string | null
@@ -89,21 +97,33 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     set({ session: null, user: null, profile: null })
   },
 
+  /**
+   * Loads the signed-in user's profile + resolved permission keyring.
+   *
+   * Reads /api/me rather than the profiles table with the anon Supabase
+   * client: permissions live in role_permissions, so the table alone cannot
+   * answer "what may this person do". The API is the single source.
+   *
+   * If the call fails (offline, API down) the previous profile is kept —
+   * better to render stale permissions than to log the user out mid-task.
+   */
   async refreshProfile() {
     const user = get().user
     if (!user) return
-    const { data, error } = await supabase
-      .from('profiles')
-      .select('id, display_name, role, avatar_url, suspended_at, deleted_at')
-      .eq('id', user.id)
-      .maybeSingle()
-    if (error) {
-      // RLS may deny the read for anon key — backend will fetch on first API call.
+
+    const session = get().session
+    if (!session?.access_token) return
+
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/me`, {
+        headers: { authorization: `Bearer ${session.access_token}` },
+      })
+      if (!res.ok) return
+      const body = (await res.json()) as { data: Profile }
+      set({ profile: body.data })
+    } catch (err) {
       // eslint-disable-next-line no-console
-      console.warn('[auth] refreshProfile failed', error)
-      return
+      console.warn('[auth] refreshProfile failed', err)
     }
-    if (!data) return
-    set({ profile: data as Profile })
   },
 }))

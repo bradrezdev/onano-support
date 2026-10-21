@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { z } from 'zod'
-import { requireRole } from '@/lib/auth'
+import { requirePermission } from '@/lib/auth'
 import { parseJson } from '@/lib/validate'
 import { reorderFlows, findFlowOrThrow, ThemeError } from '@/services/themes'
 
@@ -12,7 +12,7 @@ const ReorderBody = z.object({
 type Params = { params: Promise<{ id: string }> }
 
 export async function POST(request: Request, ctx: Params) {
-  const auth = await requireRole(['admin', 'supervisor'], request)
+  const auth = await requirePermission(['flow.create'], request)
   if ('error' in auth) return auth.error
   const { id: firstId } = await ctx.params
 

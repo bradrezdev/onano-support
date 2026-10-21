@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { z } from 'zod'
-import { requireRole } from '@/lib/auth'
+import { requirePermission } from '@/lib/auth'
 import { parseJson, getQuery } from '@/lib/validate'
 import { normalizePhone, isLikelyWhatsapp } from '@/lib/phone'
 import { createSupabaseAdminClient } from '@/lib/supabase/admin'
@@ -16,7 +16,7 @@ const ContactCreate = z.object({
 })
 
 export async function GET(request: Request) {
-  const auth = await requireRole(['admin', 'supervisor', 'soporte'], request)
+  const auth = await requirePermission(['contact.read'], request)
   if ('error' in auth) return auth.error
 
   const q = getQuery<{
@@ -40,8 +40,20 @@ export async function GET(request: Request) {
     .order('updated_at', { ascending: false })
     .range((page - 1) * limit, page * limit - 1)
 
-  if (q.q) {
-    query = query.ilike('name', `%${q.q}%`)
+  if (q.q && q.q.trim()) {
+    // C3: search across name, phone and email.
+    //
+    // Phone is the identifying field (recommendation 15: "usando el teléfono
+    // como identificador"), so a digit string must find the contact even when
+    // the name does not contain it. The term is also normalised to E.164 when
+    // it looks like a phone, so "+1 555 0100" matches "+15550100" — otherwise
+    // the same person becomes two records because of formatting.
+    const term = q.q.trim()
+    const e164 = isLikelyWhatsapp(term) ? normalizePhone(term) : null
+    const orFilter = e164
+      ? `name.ilike.%${term}%,whatsapp_number.ilike.%${e164}%,email.ilike.%${term}%`
+      : `name.ilike.%${term}%,whatsapp_number.ilike.%${term}%,email.ilike.%${term}%`
+    query = query.or(orFilter)
   }
   if (q.country) {
     query = query.ilike('country', `%${q.country}%`)
@@ -58,7 +70,7 @@ export async function GET(request: Request) {
 }
 
 export async function POST(request: Request) {
-  const auth = await requireRole(['admin', 'supervisor', 'soporte'], request)
+  const auth = await requirePermission(['contact.create'], request)
   if ('error' in auth) return auth.error
 
   const parsed = await parseJson(request, ContactCreate)

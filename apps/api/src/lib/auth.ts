@@ -2,12 +2,17 @@ import { cookies } from 'next/headers'
 import { NextResponse } from 'next/server'
 import { createSupabaseServerClient } from './supabase/server'
 import { createSupabaseAdminClient } from './supabase/admin'
+import type { Permission } from './permissions'
 
 export interface AuthedUser {
   id: string
   email: string | null
   role: 'admin' | 'supervisor' | 'soporte'
+  role_key: string
+  permissions: Permission[]
   display_name: string | null
+  /** Self-set contact number from the profile page. Display only. */
+  phone: string | null
   suspended_at: string | null
   deleted_at: string | null
 }
@@ -58,12 +63,14 @@ export async function getCurrentUser(request?: Request): Promise<AuthedUser | nu
 
   const { data: profileRow } = await admin
     .from('profiles')
-    .select('id, role, display_name, suspended_at, deleted_at')
+    .select('id, role, role_key, display_name, phone, suspended_at, deleted_at')
     .eq('id', userId)
     .maybeSingle<{
       id: string
       role: AuthedUser['role']
+      role_key: string | null
       display_name: string | null
+      phone: string | null
       suspended_at: string | null
       deleted_at: string | null
     }>()
@@ -72,11 +79,21 @@ export async function getCurrentUser(request?: Request): Promise<AuthedUser | nu
   if (!profile) return null
   if (profile.suspended_at || profile.deleted_at) return null
 
+  // One round trip resolves the whole keyring. A custom role that grants
+  // nothing resolves to an empty array — which is exactly what should happen,
+  // and is debuggable instead of silently acting as admin.
+  const { data: permKeys } = await admin.rpc('resolve_permissions', {
+    p_profile_id: userId,
+  })
+
   return {
     id: userId,
     email: userEmail,
     role: profile.role,
+    role_key: profile.role_key ?? profile.role,
+    permissions: Array.isArray(permKeys) ? (permKeys as Permission[]) : [],
     display_name: profile.display_name ?? null,
+    phone: profile.phone ?? null,
     suspended_at: profile.suspended_at ?? null,
     deleted_at: profile.deleted_at ?? null,
   }
@@ -114,6 +131,68 @@ export async function requireRole(
           code: 'forbidden',
           error: 'forbidden',
           message: `Requires role: ${roles.join(' | ')}`,
+        },
+        { status: 403 },
+      ),
+    }
+  }
+  return result
+}
+
+/**
+ * Enforces a single permission key (R2, recommendation 1).
+ *
+ * This is the guard new code should use. `requireRole` still exists because
+ * it is what 48 route handlers call today, but it can only express "which of
+ * the three shipped roles" — it cannot express "whoever holds the key to
+ * reopen tickets", which is the whole point of custom roles.
+ *
+ * Passing several keys means "any of these" (OR). Use requireAllPermissions
+ * when every key is needed.
+ */
+export async function requirePermission(
+  permissions: Permission[],
+  request?: Request,
+): Promise<{ user: AuthedUser } | { error: NextResponse }> {
+  const result = await requireUser(request)
+  if ('error' in result) return result
+
+  const held = result.user.permissions
+  const granted = permissions.some((p) => held.includes(p))
+  if (!granted) {
+    return {
+      error: NextResponse.json(
+        {
+          code: 'forbidden',
+          error: 'forbidden',
+          message: `Requires permission: ${permissions.join(' | ')}`,
+          required: permissions,
+        },
+        { status: 403 },
+      ),
+    }
+  }
+  return result
+}
+
+/** Every listed key must be held. */
+export async function requireAllPermissions(
+  permissions: Permission[],
+  request?: Request,
+): Promise<{ user: AuthedUser } | { error: NextResponse }> {
+  const result = await requireUser(request)
+  if ('error' in result) return result
+
+  const held = result.user.permissions
+  const missing = permissions.filter((p) => !held.includes(p))
+  if (missing.length > 0) {
+    return {
+      error: NextResponse.json(
+        {
+          code: 'forbidden',
+          error: 'forbidden',
+          message: `Missing permissions: ${missing.join(', ')}`,
+          required: permissions,
         },
         { status: 403 },
       ),

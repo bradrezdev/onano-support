@@ -1,5 +1,13 @@
 import { describe, it, expect } from 'vitest'
-import { can, isAdmin, isSupervisorOrAbove, type Action } from './permissions'
+import {
+  can,
+  canPermission,
+  canWith,
+  isAdmin,
+  isSupervisorOrAbove,
+  type Action,
+  type Permission,
+} from './permissions'
 
 describe('can', () => {
   it('returns false for null/undefined role', () => {
@@ -37,14 +45,21 @@ describe('can', () => {
     }
   })
 
-  it('supervisor can NOT close or reopen tickets', () => {
-    expect(can('supervisor', 'ticket.close')).toBe(false)
-    expect(can('supervisor', 'ticket.reopen')).toBe(false)
+  it('supervisor CAN close and reopen tickets (T4)', () => {
+    expect(can('supervisor', 'ticket.close')).toBe(true)
+    expect(can('supervisor', 'ticket.reopen')).toBe(true)
   })
 
-  it('supervisor can NOT create/delete themes', () => {
-    expect(can('supervisor', 'theme.create')).toBe(false)
+  it('supervisor CAN create themes but NOT delete them (P1)', () => {
+    expect(can('supervisor', 'theme.create')).toBe(true)
     expect(can('supervisor', 'theme.delete')).toBe(false)
+  })
+
+  it('supervisor can NOT delete tickets or manage accounts', () => {
+    expect(can('supervisor', 'ticket.delete')).toBe(false)
+    expect(can('supervisor', 'admin.viewAccounts')).toBe(false)
+    expect(can('supervisor', 'admin.viewAudit')).toBe(false)
+    expect(can('supervisor', 'admin.manageRoles')).toBe(false)
   })
 
   it('supervisor CAN move tickets between flows and assign them', () => {
@@ -86,5 +101,66 @@ describe('isSupervisorOrAbove', () => {
     expect(isSupervisorOrAbove('supervisor')).toBe(true)
     expect(isSupervisorOrAbove('soporte')).toBe(false)
     expect(isSupervisorOrAbove(null)).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// canPermission — the real check, reading the server-resolved keyring (R2)
+// ---------------------------------------------------------------------------
+
+describe('canPermission', () => {
+  it('grants only what the keyring lists', () => {
+    const auditor: Permission[] = ['ticket.reply', 'admin.viewAudit']
+    expect(canPermission(auditor, 'ticket.reply')).toBe(true)
+    expect(canPermission(auditor, 'admin.viewAudit')).toBe(true)
+    expect(canPermission(auditor, 'ticket.delete')).toBe(false)
+    expect(canPermission(auditor, 'admin.assignRole')).toBe(false)
+  })
+
+  it('denies everything for an empty keyring', () => {
+    // The blank-badge case: a role with no keys can do nothing.
+    expect(canPermission([], 'ticket.reply')).toBe(false)
+  })
+
+  it('denies everything for null/undefined', () => {
+    expect(canPermission(null, 'ticket.reply')).toBe(false)
+    expect(canPermission(undefined, 'ticket.reply')).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// canWith — picks the keyring when present, shipped fallback otherwise
+// ---------------------------------------------------------------------------
+
+describe('canWith', () => {
+  it('prefers the server keyring over the shipped fallback', () => {
+    // A custom role with no permissions but a legacy admin column: the
+    // keyring wins, so it cannot act like an admin.
+    expect(
+      canWith({ role: 'admin', permissions: [] }, 'ticket.delete'),
+    ).toBe(false)
+  })
+
+  it('falls back to the shipped matrix only when no keyring arrived yet', () => {
+    // permissions === undefined means /api/me has not resolved. Once it has,
+    // even an empty array is an authoritative "holds nothing".
+    expect(canWith({ role: 'supervisor' }, 'ticket.close')).toBe(true)
+    expect(canWith({ role: 'soporte' }, 'ticket.close')).toBe(false)
+  })
+
+  it('treats an empty keyring as "holds nothing", never as the fallback', () => {
+    expect(canWith({ role: 'admin', permissions: [] }, 'ticket.create')).toBe(false)
+    expect(canWith({ role: 'admin', permissions: [] }, 'conversation.read')).toBe(false)
+  })
+
+  it('uses the keyring when it is non-empty', () => {
+    expect(
+      canWith({ role: 'soporte', permissions: ['ticket.close'] }, 'ticket.close'),
+    ).toBe(true)
+  })
+
+  it('denies for a null profile', () => {
+    expect(canWith(null, 'ticket.create')).toBe(false)
+    expect(canWith(undefined, 'ticket.create')).toBe(false)
   })
 })

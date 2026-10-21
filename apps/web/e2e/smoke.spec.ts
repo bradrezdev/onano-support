@@ -11,8 +11,10 @@ import { test, expect } from '@playwright/test'
  */
 
 const PROTECTED_ROUTES = [
+  '/',
   '/inbox',
   '/tickets',
+  '/tickets/new',
   '/categories',
   '/contacts',
   '/themes',

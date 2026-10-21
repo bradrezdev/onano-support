@@ -37,6 +37,8 @@ const mockAdmin: any = {
     admin: {
       listUsers: vi.fn(),
       getUserById: vi.fn(),
+      createUser: vi.fn(),
+      deleteUser: vi.fn(),
     },
   },
 }
@@ -51,6 +53,9 @@ beforeEach(() => {
   mockAdmin.from.mockReset()
   mockAdmin.auth.admin.listUsers.mockReset()
   mockAdmin.auth.admin.getUserById.mockReset()
+  mockAdmin.auth.admin.createUser.mockReset()
+  mockAdmin.auth.admin.deleteUser.mockReset()
+  mockAdmin.auth.admin.deleteUser.mockResolvedValue({ data: null, error: null })
 })
 
 function makeProfile(overrides: Partial<UserWithProfile> = {}): UserWithProfile {
@@ -58,7 +63,9 @@ function makeProfile(overrides: Partial<UserWithProfile> = {}): UserWithProfile 
     id: 'u-1',
     email: 'a@b.com',
     display_name: 'Alice',
+    phone: null,
     role: 'admin',
+    role_key: 'admin',
     avatar_url: null,
     suspended_at: null,
     deleted_at: null,
@@ -138,22 +145,57 @@ describe('updateUser — deleted-user guard', () => {
 
 describe('updateUser — mutations', () => {
   it('changes role when patch differs from current', async () => {
-    const before = makeProfile({ id: 'u-2', role: 'soporte' })
+    const before = makeProfile({ id: 'u-2', role: 'soporte', role_key: 'soporte' })
     setUpFindUser(before)
+    // The role lookup happens before the update (R2: the slug must exist).
+    const roleQ = new QueryMock()
+    roleQ.payload = { data: { key: 'supervisor', is_system: true }, error: null }
+    mockAdmin.from.mockReturnValueOnce(roleQ)
     const updateQ = new QueryMock()
     updateQ.payload = { data: null, error: null }
     mockAdmin.from.mockReturnValueOnce(updateQ)
 
     const out = await users.updateUser('u-2', { role: 'supervisor' }, 'u-1')
-    expect(out.role).toBe('supervisor')
+    expect(out.role_key).toBe('supervisor')
+    // A shipped role mirrors into both columns; the legacy one keeps its
+    // check constraint satisfied.
     const updateOp = updateQ.ops.find((o) => o.op === 'update')
-    expect(updateOp!.args[0]).toEqual({ role: 'supervisor' })
+    expect(updateOp!.args[0]).toEqual({ role_key: 'supervisor', role: 'supervisor' })
     const eqOp = updateQ.ops.find((o) => o.op === 'eq')
     expect(eqOp!.args).toEqual(['id', 'u-2'])
   })
 
+  it('writes only role_key for a custom role, leaving the legacy column alone', async () => {
+    const before = makeProfile({ id: 'u-2', role: 'soporte', role_key: 'soporte' })
+    setUpFindUser(before)
+    const roleQ = new QueryMock()
+    roleQ.payload = { data: { key: 'auditor', is_system: false }, error: null }
+    mockAdmin.from.mockReturnValueOnce(roleQ)
+    const updateQ = new QueryMock()
+    updateQ.payload = { data: null, error: null }
+    mockAdmin.from.mockReturnValueOnce(updateQ)
+
+    await users.updateUser('u-2', { role: 'auditor' }, 'u-1')
+    const updateOp = updateQ.ops.find((o) => o.op === 'update')
+    // A custom slug cannot pass the legacy check constraint, so it is not
+    // written there. role_key is the source of truth.
+    expect(updateOp!.args[0]).toEqual({ role_key: 'auditor' })
+  })
+
+  it('rejects a role that does not exist', async () => {
+    const before = makeProfile({ id: 'u-2', role: 'soporte', role_key: 'soporte' })
+    setUpFindUser(before)
+    const roleQ = new QueryMock()
+    roleQ.payload = { data: null, error: null }
+    mockAdmin.from.mockReturnValueOnce(roleQ)
+
+    await expect(users.updateUser('u-2', { role: 'ghost' }, 'u-1')).rejects.toMatchObject({
+      code: 'role_not_found',
+    })
+  })
+
   it('does not call update when role patch equals current role', async () => {
-    const before = makeProfile({ id: 'u-2', role: 'admin' })
+    const before = makeProfile({ id: 'u-2', role: 'admin', role_key: 'admin' })
     setUpFindUser(before)
     // No update call expected; if it were, we would mockReturnValueOnce and fail.
     const out = await users.updateUser('u-2', { role: 'admin' }, 'u-1')
@@ -210,8 +252,11 @@ describe('updateUser — mutations', () => {
   })
 
   it('propagates Supabase errors from update', async () => {
-    const before = makeProfile({ id: 'u-2', role: 'soporte' })
+    const before = makeProfile({ id: 'u-2', role: 'soporte', role_key: 'soporte' })
     setUpFindUser(before)
+    const roleQ = new QueryMock()
+    roleQ.payload = { data: { key: 'admin', is_system: true }, error: null }
+    mockAdmin.from.mockReturnValueOnce(roleQ)
     const updateQ = new QueryMock()
     updateQ.payload = { data: null, error: { message: 'db down' } }
     mockAdmin.from.mockReturnValueOnce(updateQ)
@@ -270,5 +315,161 @@ describe('searchUsers', () => {
     })
     const out = await users.searchUsers('alice')
     expect(out).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// createUser — the two-step write that must not leave half an account
+// ---------------------------------------------------------------------------
+
+describe('createUser', () => {
+  function roleQ(key: string, isSystem = false) {
+    const q = new QueryMock()
+    q.payload = { data: { key, is_system: isSystem }, error: null }
+    return q
+  }
+  // The profile row is created by the handle_new_user trigger, so this service
+  // updates it — never inserts. A mock cannot model the trigger, which is
+  // exactly why the live smoke test exists.
+  function updateQ(ok: boolean) {
+    const q = new QueryMock()
+    q.payload = ok
+      ? { data: null, error: null }
+      : { data: null, error: { message: 'profiles update failed' } }
+    return q
+  }
+
+  it('creates the auth user and configures the trigger-made profile', async () => {
+    mockAdmin.from
+      .mockReturnValueOnce(roleQ('soporte', true))
+      .mockReturnValueOnce(updateQ(true))
+    mockAdmin.auth.admin.createUser.mockResolvedValue({
+      data: { user: { id: 'new-1', email: 'nuevo@x.com', created_at: '2026-01-01' } },
+      error: null,
+    })
+
+    const out = await users.createUser(
+      { email: '  Nuevo@X.com ', password: 'abcd1234', display_name: ' Nueva ' },
+      'admin-1',
+    )
+
+    expect(out.id).toBe('new-1')
+    expect(out.email).toBe('nuevo@x.com') // lowercased + trimmed
+    expect(out.role_key).toBe('soporte')
+    expect(mockAdmin.auth.admin.createUser).toHaveBeenCalledWith({
+      email: 'nuevo@x.com',
+      password: 'abcd1234',
+      email_confirm: true,
+      user_metadata: { display_name: 'Nueva' },
+    })
+  })
+
+  it('deletes the auth user when the profile update fails', async () => {
+    // The failure mode this guards: an identity with no profiles row can sign
+    // in and is then rejected by every route, which reads as a bad password
+    // and cannot be fixed from the UI.
+    mockAdmin.from
+      .mockReturnValueOnce(roleQ('soporte', true))
+      .mockReturnValueOnce(updateQ(false))
+    mockAdmin.auth.admin.createUser.mockResolvedValue({
+      data: { user: { id: 'new-2', email: 'x@y.com', created_at: '2026-01-01' } },
+      error: null,
+    })
+
+    await expect(
+      users.createUser({ email: 'x@y.com', password: 'abcd1234' }, 'admin-1'),
+    ).rejects.toMatchObject({ code: 'profile_failed' })
+
+    expect(mockAdmin.auth.admin.deleteUser).toHaveBeenCalledWith('new-2')
+  })
+
+  it('rejects an unknown role before creating anything in Auth', async () => {
+    const missing = new QueryMock()
+    missing.payload = { data: null, error: null }
+    mockAdmin.from.mockReturnValueOnce(missing)
+
+    await expect(
+      users.createUser(
+        { email: 'x@y.com', password: 'abcd1234', role_key: 'inventado' },
+        'admin-1',
+      ),
+    ).rejects.toMatchObject({ code: 'role_not_found' })
+
+    expect(mockAdmin.auth.admin.createUser).not.toHaveBeenCalled()
+  })
+
+  it('maps an already-registered email to email_taken, not a 500', async () => {
+    mockAdmin.from.mockReturnValueOnce(roleQ('soporte', true))
+    mockAdmin.auth.admin.createUser.mockResolvedValue({
+      data: { user: null },
+      error: { message: 'User already registered' },
+    })
+
+    await expect(
+      users.createUser({ email: 'dupe@x.com', password: 'abcd1234' }, 'admin-1'),
+    ).rejects.toMatchObject({ code: 'email_taken' })
+  })
+
+  it('omits the legacy role column for a custom role', async () => {
+    mockAdmin.from
+      .mockReturnValueOnce(roleQ('auditor'))
+      .mockReturnValueOnce(updateQ(true))
+    mockAdmin.auth.admin.createUser.mockResolvedValue({
+      data: { user: { id: 'new-3', email: 'a@b.com', created_at: '2026-01-01' } },
+      error: null,
+    })
+
+    await users.createUser(
+      { email: 'a@b.com', password: 'abcd1234', role_key: 'auditor' },
+      'admin-1',
+    )
+
+    const updated = mockAdmin.from.mock.results[1]!.value as QueryMock
+    const row = updated.ops.find((o) => o.op === 'update')!.args[0] as Record<string, unknown>
+    // The column has a check constraint for the three shipped slugs; a custom
+    // key would be rejected by the DB, so it must not be sent.
+    expect(row.role_key).toBe('auditor')
+    expect(row).not.toHaveProperty('role')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// updateOwnProfile — two fields, nothing else
+// ---------------------------------------------------------------------------
+
+describe('updateOwnProfile', () => {
+  it('normalizes an empty phone to null rather than rejecting it', async () => {
+    const upd = new QueryMock()
+    upd.payload = { data: null, error: null }
+    const read = new QueryMock()
+    read.payload = { data: { display_name: 'Ana', phone: null }, error: null }
+    mockAdmin.from.mockReturnValueOnce(upd).mockReturnValueOnce(read)
+
+    const out = await users.updateOwnProfile('u-1', { phone: '   ' })
+    expect(out.phone).toBeNull()
+    const row = upd.ops.find((o) => o.op === 'update')!.args[0] as Record<string, unknown>
+    expect(row.phone).toBeNull()
+  })
+
+  it('strips letters out of the phone and keeps the digits', async () => {
+    const upd = new QueryMock()
+    upd.payload = { data: null, error: null }
+    const read = new QueryMock()
+    read.payload = { data: { display_name: 'Ana', phone: '+52 555 1234567' }, error: null }
+    mockAdmin.from.mockReturnValueOnce(upd).mockReturnValueOnce(read)
+
+    await users.updateOwnProfile('u-1', { phone: 'llama a +52 555 1234567' })
+    const row = upd.ops.find((o) => o.op === 'update')!.args[0] as Record<string, unknown>
+    expect(row.phone).toBe('+52 555 1234567')
+  })
+
+  it('writes nothing when the patch is empty', async () => {
+    const read = new QueryMock()
+    read.payload = { data: { display_name: 'Ana', phone: null }, error: null }
+    mockAdmin.from.mockReturnValueOnce(read)
+
+    await users.updateOwnProfile('u-1', {})
+    const q = mockAdmin.from.mock.results[0]!.value as QueryMock
+    expect(q.ops.find((o) => o.op === 'update')).toBeUndefined()
   })
 })

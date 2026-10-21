@@ -157,5 +157,38 @@ export async function upsertRoleColor(
     .select('role, base_color, fade_steps')
     .single<RoleColorSetting>()
   if (error) throw error
+
+  // The same color lives in two tables. `role_color_settings` drives the message
+  // bubbles; `roles.color` drives the role badges and swatches. They used to
+  // drift — `admin` literally carried #5692ff in one table and #85baff in the
+  // other, because nothing wrote both. Whichever endpoint runs, both rows end
+  // up holding the same value.
+  //
+  // Best-effort by design: the role_color_settings write is the one that was
+  // asked for and it already succeeded. A custom role has no row here at all
+  // (this endpoint only accepts the three shipped slugs), and a missing
+  // `roles` row must not fail an edit that worked.
+  //
+  // The try/catch wraps the chain construction too, not just the await. The
+  // builder can throw synchronously (a missing method on a client, a bad
+  // shape), and a promise `.catch` would never see that — the throw would
+  // escape before any await and fail the request the admin already succeeded
+  // at. Async code with a "best effort" comment needs the guard to actually
+  // cover the synchronous half.
+  try {
+    const { error: roleColorErr } = await admin
+      .from('roles')
+      .update({ color: baseColor })
+      .eq('key', role)
+    if (roleColorErr) {
+      console.warn('[role-colors] roles.color not synced', roleColorErr.message)
+    }
+  } catch (mirrorErr) {
+    console.warn(
+      '[role-colors] roles.color mirror threw',
+      mirrorErr instanceof Error ? mirrorErr.message : mirrorErr,
+    )
+  }
+
   return data
 }

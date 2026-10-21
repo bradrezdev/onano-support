@@ -25,6 +25,7 @@ class QueryMock {
   limit(n: number) { return this.record('limit', [n]) }
   insert(rows: unknown) { return this.record('insert', [rows]) }
   upsert(rows: unknown, opts: unknown) { return this.record('upsert', [rows, opts]) }
+  update(rows: unknown) { return this.record('update', [rows]) }
 
   // terminals
   maybeSingle(): Promise<Response> {
@@ -241,6 +242,11 @@ describe('upsertRoleColor', () => {
     mockAdmin.from.mockReturnValueOnce(
       makePromise({ data: { role: 'admin', base_color: '#abcdef', fade_steps: 8 } }),
     )
+    // Second call is the mirror write into roles.color — the same edit must
+    // land in both tables or they drift (they already did, once).
+    mockAdmin.from.mockReturnValueOnce(
+      makePromise({ data: null, error: null }),
+    )
     const out = await ticketMessages.upsertRoleColor('admin', '#ABCDEF', 8, 'u1')
     expect(out.role).toBe('admin')
     expect(out.fade_steps).toBe(8)
@@ -250,6 +256,25 @@ describe('upsertRoleColor', () => {
     const [rows, opts] = upsertCall!.args as [Record<string, unknown>, { onConflict: string }]
     expect(rows).toMatchObject({ role: 'admin', base_color: '#ABCDEF', fade_steps: 8, updated_by: 'u1' })
     expect(opts).toEqual({ onConflict: 'role' })
+
+    const mirror = mockAdmin.from.mock.results[1]!.value as QueryMock
+    const mirrorUpdate = mirror.ops.find((o) => o.op === 'update')
+    expect(mirrorUpdate).toBeDefined()
+    expect(mirrorUpdate!.args[0]).toEqual({ color: '#ABCDEF' })
+    expect(mirror.ops.find((o) => o.op === 'eq')!.args).toEqual(['key', 'admin'])
+  })
+
+  it('still returns the setting when the roles.color mirror fails', async () => {
+    mockAdmin.from.mockReturnValueOnce(
+      makePromise({ data: { role: 'admin', base_color: '#abcdef', fade_steps: 8 } }),
+    )
+    mockAdmin.from.mockReturnValueOnce(
+      makePromise({ data: null, error: { message: 'roles table locked' } }),
+    )
+    // The requested write succeeded. A best-effort mirror must not turn that
+    // into an error the admin sees on a save that actually worked.
+    const out = await ticketMessages.upsertRoleColor('admin', '#ABCDEF', 8, 'u1')
+    expect(out.base_color).toBe('#abcdef')
   })
 })
 

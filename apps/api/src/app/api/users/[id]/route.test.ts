@@ -7,10 +7,14 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 // ---------------------------------------------------------------------------
 
 const mockRequireRole = vi.fn()
+const mockRequireUser = vi.fn()
+const mockRequirePermission = vi.fn()
 
 vi.mock('@/lib/auth', () => ({
-  requireUser: vi.fn(),
+  requireUser: (...args: unknown[]) => mockRequireUser(...args),
   requireRole: (...args: unknown[]) => mockRequireRole(...args),
+  requirePermission: (...args: unknown[]) => mockRequirePermission(...args),
+  requireAllPermissions: (...args: unknown[]) => mockRequirePermission(...args),
   getCurrentUser: vi.fn(),
 }))
 
@@ -59,29 +63,55 @@ const { GET, PATCH } = await import('./route')
 
 beforeEach(() => {
   mockRequireRole.mockReset()
+  mockRequireUser.mockReset()
+  mockRequirePermission.mockReset()
   mockAdmin.from.mockReset()
   mockAdmin.auth.admin.listUsers.mockReset()
   mockAdmin.auth.admin.getUserById.mockReset()
 })
 
+/** All permission keys an admin holds. Mirrors the seeded admin keyring. */
+const ADMIN_PERMISSIONS = [
+  'admin.createUser',
+  'admin.suspendUser',
+  'admin.deleteUser',
+  'admin.assignRole',
+  'admin.manageRoles',
+  'admin.viewAudit',
+  'admin.viewAccounts',
+] as const
+
+function actorUser(role: 'admin' | 'supervisor' | 'soporte' = 'admin', userId = 'u-actor') {
+  return {
+    id: userId,
+    email: 'actor@example.com',
+    role,
+    role_key: role,
+    permissions: role === 'admin' ? [...ADMIN_PERMISSIONS] : [],
+    display_name: 'Actor',
+    suspended_at: null,
+    deleted_at: null,
+  }
+}
+
+/** PATCH uses requireUser then checks permissions inline. */
 function okAuth(role: 'admin' | 'supervisor' | 'soporte' = 'admin', userId = 'u-actor') {
-  return mockRequireRole.mockResolvedValue({
-    user: {
-      id: userId,
-      email: 'actor@example.com',
-      role,
-      display_name: 'Actor',
-      suspended_at: null,
-      deleted_at: null,
-    },
-  })
+  const user = actorUser(role, userId)
+  mockRequireUser.mockResolvedValue({ user })
+  mockRequireRole.mockResolvedValue({ user })
+  mockRequirePermission.mockResolvedValue({ user })
+  return mockRequireUser
 }
 
 function denyAuth(status: number, code: string, message: string) {
   const { NextResponse } = require('next/server') as typeof import('next/server')
-  return mockRequireRole.mockResolvedValue({
+  const payload = {
     error: NextResponse.json({ code, error: code, message }, { status }),
-  })
+  }
+  mockRequireUser.mockResolvedValue(payload)
+  mockRequireRole.mockResolvedValue(payload)
+  mockRequirePermission.mockResolvedValue(payload)
+  return mockRequireUser
 }
 
 function makeUserPayload(role = 'admin') {
@@ -133,13 +163,30 @@ describe('PATCH /api/users/[id] — auth', () => {
     expect(body.code).toBe('unauthorized')
   })
 
-  it('returns 403 when a non-admin tries to patch', async () => {
-    denyAuth(403, 'forbidden', 'Requires role: admin')
+  it('returns 403 when a supervisor without admin.assignRole tries to patch', async () => {
+    okAuth('supervisor')
     const res = await PATCH(
       new Request('http://x/api/users/u-target', { method: 'PATCH', body: JSON.stringify({ role: 'soporte' }) }),
       ctx('u-target'),
     )
     expect(res.status).toBe(403)
+    const body = (await res.json()) as { code: string; required: string[] }
+    expect(body.code).toBe('forbidden')
+    expect(body.required).toContain('admin.assignRole')
+  })
+
+  it('returns 403 when the actor lacks admin.suspendUser but wants to suspend', async () => {
+    // Has assignRole but not suspendUser: the two powers are separate.
+    mockRequireUser.mockResolvedValue({
+      user: { ...actorUser('supervisor'), permissions: ['admin.assignRole'] },
+    })
+    const res = await PATCH(
+      new Request('http://x/api/users/u-target', { method: 'PATCH', body: JSON.stringify({ suspend: true }) }),
+      ctx('u-target'),
+    )
+    expect(res.status).toBe(403)
+    const body = (await res.json()) as { required: string[] }
+    expect(body.required).toEqual(['admin.suspendUser'])
   })
 })
 
@@ -163,12 +210,12 @@ describe('PATCH /api/users/[id] — Zod validation', () => {
     expect(body.code).toBe('invalid_json')
   })
 
-  it('returns 400 validation_failed when role is not in the enum', async () => {
+  it('returns 400 validation_failed when role slug is malformed', async () => {
     okAuth()
     const res = await PATCH(
       new Request('http://x/api/users/u-target', {
         method: 'PATCH',
-        body: JSON.stringify({ role: 'god' }),
+        body: JSON.stringify({ role: 'Not A Slug' }),
         headers: { 'content-type': 'application/json' },
       }),
       ctx('u-target'),
@@ -177,6 +224,27 @@ describe('PATCH /api/users/[id] — Zod validation', () => {
     const body = (await res.json()) as { code: string; details: Array<{ path: string }> }
     expect(body.code).toBe('validation_failed')
     expect(body.details[0]!.path).toBe('role')
+  })
+
+  it('returns 400 role_not_found when the slug is well-formed but unknown', async () => {
+    // R2: any slug passes Zod; the service decides whether it exists.
+    okAuth()
+    setupFindUser(makeUserPayload('soporte'))
+    const roleQ = new QueryMock()
+    roleQ.payload = { data: null, error: null }
+    mockAdmin.from.mockReturnValueOnce(roleQ)
+
+    const res = await PATCH(
+      new Request('http://x/api/users/u-target', {
+        method: 'PATCH',
+        body: JSON.stringify({ role: 'ghost' }),
+        headers: { 'content-type': 'application/json' },
+      }),
+      ctx('u-target'),
+    )
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { code: string }
+    expect(body.code).toBe('role_not_found')
   })
 
   it('rejects display_name > 120 chars', async () => {
@@ -300,8 +368,12 @@ describe('PATCH /api/users/[id] — error mapping', () => {
 describe('PATCH /api/users/[id] — happy path', () => {
   it('applies role change when actor is admin and target != actor', async () => {
     okAuth('admin', 'u-actor') // different from u-target
-    const before = makeUserPayload('soporte')
+    const before = { ...makeUserPayload('soporte'), role_key: 'soporte' }
     setupFindUser(before)
+    // Role lookup first (R2), then the update.
+    const roleQ = new QueryMock()
+    roleQ.payload = { data: { key: 'admin', is_system: true }, error: null }
+    mockAdmin.from.mockReturnValueOnce(roleQ)
     const updateQ = new QueryMock()
     updateQ.payload = { data: null, error: null }
     mockAdmin.from.mockReturnValueOnce(updateQ)

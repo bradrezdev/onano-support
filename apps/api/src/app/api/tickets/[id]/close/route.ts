@@ -1,11 +1,17 @@
 import { NextResponse } from 'next/server'
-import { requireRole } from '@/lib/auth'
+import { requirePermission } from '@/lib/auth'
 import { closeTicket, TicketValidationError } from '@/services/tickets'
 
 type Params = { params: Promise<{ id: string }> }
 
+/**
+ * POST /api/tickets/:id/close
+ *
+ * T4: whoever holds `ticket.close`. By default that is Admin, Supervisor and
+ * Soporte — and an Admin can grant it to a custom role without touching code.
+ */
 export async function POST(request: Request, ctx: Params) {
-  const auth = await requireRole(['admin'], request)
+  const auth = await requirePermission(['ticket.close'], request)
   if ('error' in auth) return auth.error
   const { id } = await ctx.params
 

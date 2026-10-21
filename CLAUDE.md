@@ -4,95 +4,118 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 # whatsapp-CRM — multi-user WhatsApp CRM
 
-Monorepo with two apps under `apps/*` (pnpm workspaces), one Supabase Postgres schema, and a direct-DB admin script that bypasses RLS.
+Monorepo of two apps under `apps/*` (pnpm workspaces) sharing one Supabase project: a Next.js API that owns all data access, and a Vite SPA that never touches Postgres.
 
-## Stack (what's actually in the tree, not the README)
+## Visión y alcance
 
-The root `README.md` is **stale** — it describes "Fastify backend + Vue 3 frontend". The actual code is:
+CRM interno de ONANO Global para gestionar incidencias (pagos, registros, red, envíos) ligadas a clientes y atender conversaciones de WhatsApp (Twilio) en equipo. Los clientes son registros sin login; los usuarios son Admin, Supervisor y Soporte **más roles personalizados que un Admin crea desde la UI**.
 
-- **`apps/api/`** — **Next.js 16.4.2** (App Router, port 3000) with TypeScript strict mode, Zod validation, Supabase server + admin clients. Replaces the planned Fastify service.
-- **`apps/web/`** — **React 19 + Vite + TypeScript** (port 5173), Tailwind v3, Zustand, React Router v6 (`v7_relativeSplatPath` future flag enabled). Replaces the planned Vue 3 SPA.
-- **`supabase/migrations/`** — SQL migrations (consolidated initial + RLS fix + service_role grant).
-- **`apps/api/scripts/db.ts`** — direct Postgres admin tool using `DATABASE_URL` (superuser, **bypasses RLS**). Used for migrations, raw exec, table dumps.
+`PRODUCT_SPEC.md` (raíz del repo) es la **fuente de verdad del alcance final**. Define los requisitos C1-C3, T1-T6, P1-P2, R1-R3, A1, W1-W4, D1 y el lote de operación O1-O12, con el estado ✅/⚠️/❌ de cada uno.
 
-Twilio integration is referenced in the README but the current API routes only cover `categories`, `contacts`, `flows`, `health`, `role-colors`, `themes`, `tickets`, `users` — outbound WhatsApp messaging and webhook handlers are still pending.
+**Regla de trabajo:** antes de empezar cualquier tarea, lee `PRODUCT_SPEC.md`. Al terminarla, actualiza el estado de los requisitos afectados en ese mismo archivo.
+
+## Stack (lo que hay en el árbol, no lo que dice el README)
+
+El `README.md` raíz está **desactualizado**: describe "Fastify backend + Vue 3 frontend". Lo real es:
+
+- **`apps/api/`** — Next.js 16.4.2 (App Router, `:3000`), TS strict, Zod 4, clientes Supabase server + admin. 42 route handlers bajo `src/app/api/`.
+- **`apps/web/`** — React 19 + Vite (`:5173`), Tailwind v3, Zustand, React Router v6. Cero acceso a Postgres: todo pasa por la API.
+- **`supabase/migrations/`** — 20 migraciones SQL. **El esquema vive aquí, no en Prisma/Drizzle.**
+- **`apps/api/src/middleware.ts`** — CORS. Sin él el SPA ve "Load failed" en cada `fetch` cross-origin.
+- **`apps/api/scripts/db.ts`** — herramienta admin contra Postgres directo (supera RLS).
 
 ## Commands
 
-Run from repo root unless noted.
-
 ```bash
 pnpm install
-pnpm dev            # parallel api (:3000) + web (:5173)
-pnpm dev:api        # only api
-pnpm dev:web        # only web
-pnpm build          # tsc -b + next build + vite build
-pnpm typecheck      # tsc -b --noEmit across the workspace
-pnpm clean          # rm -rf dist .turbo node_modules .vite in every workspace
+pnpm dev / dev:api / dev:web     # paralelo por defecto
+pnpm build                       # tsc -b + next build + vite build
+pnpm typecheck                   # tsc --noEmit en ambos workspaces
+pnpm test                        # vitest run (api + web)
+
+# Un solo archivo / un solo caso
+pnpm --filter @crm/api test src/services/users.test.ts
+pnpm --filter @crm/api test -t "createUser"       # por nombre de test
+pnpm --filter @crm/web test:e2e                   # Playwright
+pnpm --filter @crm/web test:e2e --headed
+pnpm --filter @crm/web lint                       # oxlint (solo web)
+
+# Playwright protegido: sin esto los tests con sesión hacen skip en silencio
+E2E_EMAIL=... E2E_PASSWORD=... pnpm --filter @crm/web test:e2e
 ```
 
-DB admin (all run via `apps/api/scripts/db.ts`, requires `DATABASE_URL` in `apps/api/.env`):
+`pnpm lint` **hoy sale con código 1**: oxlint cuenta los warnings como fallo. Son 25 warnings en 17 archivos, 0 errores, y la mayoría son preexistentes (`set-state-in-effect` y `exhaustive-deps` en el mismo patrón de carga de datos de casi todas las páginas). No lo tomes como una regresión tuya sin comparar contra `main` primero.
 
 ```bash
-pnpm --filter @crm/api db:migrate              # apply every supabase/migrations/*.sql in order
-pnpm --filter @crm/api db:exec "<SQL>"        # one SQL statement OR ./path/to.sql
-pnpm --filter @crm/api db:query <table>       # select * from public.<table> limit 50
-pnpm --filter @crm/api db:tables              # list tables in public schema
+pnpm --filter @crm/api db:migrate              # aplica migraciones en orden
+pnpm --filter @crm/api db:exec "<SQL>"        # una sentencia o ./ruta.sql
+pnpm --filter @crm/api db:query <tabla>
+pnpm --filter @crm/api db:tables
 ```
 
-The script is idempotent on "already exists" errors; other failures stop the loop with `process.exitCode = 1`.
+**Verificación contra la base real** — estos existe porque los unit tests no pueden ver triggers, columnas inexistentes ni constraints:
 
-## Repository layout
-
-```
-apps/
-  api/                  # Next.js backend — App Router under src/app
-    src/app/            # /api/* route handlers (categories, contacts, flows, health,
-                        #   role-colors, themes, tickets, users)
-    src/lib/            # auth.ts (Bearer + cookie), supabase/{server,admin}.ts,
-                        #   phone.ts, sanitize.ts, validate.ts
-    src/services/       # data access / business logic (categories, themes,
-                        #   tickets, ticket-messages, users)
-    scripts/db.ts       # direct-DB admin tool (superuser, bypasses RLS)
-  web/                  # React 19 SPA
-    src/pages/          # route components (Login, Dashboard, Contacts, Categories,
-                        #   Tickets/TicketNew/TicketDetail, Themes, FlowEditor,
-                        #   Pipeline, Users, UserDetail, NotFound)
-    src/components/     # layout/ (AppShell, Sidebar, Topbar, ProtectedRoute, RoleGuard)
-                        #   ui/ (RichTextEditor)
-    src/lib/            # api.ts (typed fetch + Bearer injection), supabase.ts,
-                        #   permissions.ts (Role type), themes.ts, users.ts
-    src/stores/auth.ts  # Zustand auth state
-    src/router.tsx      # createBrowserRouter with future v7_relativeSplatPath
-supabase/migrations/    # SQL migrations (consolidated initial, RLS fix, service_role grant)
-odd/tasks/              # working notes (whatsapp-crm.md)
+```bash
+cd apps/api
+pnpm tsx scripts/smoke-batch.ts    # servicios contra la DB (crea y destruye una cuenta)
+pnpm tsx scripts/smoke-http.ts     # route handlers sobre un JWT real
+pnpm tsx scripts/make-e2e-admin.ts # cuenta admin temporal para E2E — bórrala después
 ```
 
-## Authentication flow
+`smoke-batch.ts` restaura lo que modifica. Los dos crean datos reales: nunca los corras contra una base compartida.
 
-Both apps talk to the same Supabase project. The web SPA signs in via `@supabase/supabase-js` (anon key), stores the session, and forwards `Authorization: Bearer <jwt>` on every `apiFetch` request. The Next.js backend accepts either:
+## Arquitectura: el modelo de permisos
 
-1. `Authorization: Bearer <jwt>` (frontend API client — primary path).
-2. Supabase session cookie (server-rendered pages).
+Lo único que hay que entender antes de tocar casi cualquier cosa.
 
-See `apps/api/src/lib/auth.ts` (`getCurrentUser`, `requireUser`, `requireRole`). Roles are `admin | supervisor | soporte`. Suspended or deleted profiles are rejected at auth time.
+**Los permisos son datos; los roles son Hacazgos.** `public.permissions` es el catálogo de llaves (`ticket.assign`, `admin.manageRoles`…), `public.roles` agrupa esas llaves en un keyring, y `profiles.role_key` apunta a un rol por slug. La función `resolve_permissions(p_profile_id)` devuelve el keyring resuelto en un solo viaje; es lo que `/api/me` manda al SPA.
 
-The web router uses `ProtectedRoute` (requires session) wrapping `AppShell`, and a nested `RoleGuard allow={['admin']}` for `/categories`, `/themes`, `/themes/:id`.
+Esto significa tres cosas que no son obvias:
 
-## Key conventions
+1. **Un rol vacío es una respuesta válida, no un fallo.** Un rol recién creado sin permisos debe seguir sin permisos. En el cliente, `canWith()` decide por `permissions != null` ("¿ya llegó el keyring?"), **nunca** por `length > 0` — esa comprobación le regalaría a un rol vacío todos los poderes de su columna `role` heredada.
+2. **`requirePermission([...])` es el guard.** Ya no uses `requireRole(['admin'])` en código nuevo: no puede expresar "quien tenga la llave para reabrir", que es el punto entero de los roles personalizados. `requireAllPermissions` cuando hagan falta todas.
+3. **Mezcla campos con permisos distintos en un PATCH → pide la llave exacta de lo que toca.** Ver `PATCH /api/tickets/:id`: renombrar es `ticket.update`, reasignar es `ticket.assign`, mover de fase es `ticket.moveFlow`. Pedir la unión dejaría que quien solo puede renombrar también reasigne.
 
-- **Schema is in SQL, not Prisma/Drizzle.** All schema lives in `supabase/migrations/*.sql`. When adding a table/column/RLS policy, write a new migration file (`<timestamp>_<name>.sql`) and run `db:migrate`.
-- **API routes call `services/`, never touch Supabase directly.** Route handlers in `src/app/api/*` delegate to `src/services/*` for queries and business logic.
-- **Typed `apiFetch` everywhere on the web.** Use `api.get/post/patch/del` from `apps/web/src/lib/api.ts` — it auto-injects the Bearer token and throws `ApiError(status, code, message)` on non-2xx.
-- **All env vars come from `apps/api/.env` and `apps/web/.env`.** Never commit them. See `.env.example` at repo root for the schema.
-- **Roles are text-typed, not a Postgres enum** (`check (role in ('admin', 'supervisor', 'soporte'))`). Change the check constraint in a migration if adding a role.
-- **Tailwind palette: `brand` + `role.{admin,supervisor,soporte}`** (see `apps/web/tailwind.config.js`). Role colors also expose CSS custom properties (`--role-admin` etc.) so backend can render them in tickets.
+`profiles.role` (columna legacy, `check in ('admin','supervisor','soporte')`) **ya no es fuente de verdad** — `role_key` lo es. La columna se mantiene en sync solo para los tres slugs del sistema, porque `role_color_settings` y `ticket_messages.role_at_send` todavía la leen.
+
+## Arquitectura: acceso a datos y defensa
+
+- **Los route handlers llaman a `services/`, nunca a Supabase directo.** La lógica de negocio y sus errores tipados (`ThemeError`, `TicketValidationError`, `UserValidationError`) viven en `src/services/`; las rutas solo traducen a status codes.
+- **La API usa el cliente `service_role`, que BYPASSES RLS.** Las políticas RLS no protegen nada contra el único cliente que la app usa. Para lo que habla con `service_role`, la defensa real es a nivel de GRANT: `ticket_history` es append-only porque tiene `REVOKE UPDATE, DELETE, TRUNCATE ... FROM service_role`, no por una política. Si añades una restricción de escritura, revoca el privilegio; una política sola es decorativa.
+- **`handle_new_user` es un trigger AFTER INSERT sobre `auth.users`** y ya inserta la fila en `profiles` (con `display_name` derivado del email y `role='soporte'`). Cualquier código que cree un usuario **actualiza** esa fila; insertarla viola `profiles_pkey`. Un mock de test no tiene triggers — solo el smoke test contra la DB real lo detecta.
+- **Soft delete:** `deleted_at` + índices parciales. Las listas de trabajo filtran `.is('deleted_at', null)` y la papelera usa `.not(...)`. Es un eje aparte de `status`.
+- **Cerrar acopla la fase:** `POST /api/tickets/:id/close` salta a la fase terminal de mayor posición del proyecto; reabrir baja a la primera no terminal.
+
+## Arquitectura: dos conceptos que se confunden
+
+El esquema tiene **tres** nociones de "etapa" y solo una está viva:
+
+| Tabla | Estado |
+|---|---|
+| `themes` + `flows` | **Viva.** "Proyectos" y sus fases. Es lo que mueve el tablero. |
+| `pipeline_stages` | Muerta. 0 filas, **0 referencias en todo el código**. |
+| `conversation_stages` | Muerta. Igual. |
+
+Un ticket sin `theme_id` **no aparece en el tablero** — `PipelinePage` filtra `theme_id != null`. "Asignar a un proyecto" no es una feature separada: es lo que hace un ticket visible.
+
+**Nomenclatura (cambiada a pedido del operador — no la reviertas):** "Temas" → **Proyectos** (ícono `FolderKanban`), "Contactos" → **Clientes**.
+
+**El color de un rol vive en dos tablas:** `roles.color` (badges) y `role_color_settings.base_color` (burbujas de mensajes, vía CSS vars `--role-admin`). El espejo bidireccional vive en los **servicios**, no en la UI, para que cualquier ruta que toque el color deje las dos alineadas. Un rol personalizado solo llega a `roles`; la UI lo dice explícitamente.
+
+## Conventions
+
+- **Esquema = SQL.** Tabla o columna nueva → migración nueva (`<timestamp>_<nombre>.sql`) + `db:migrate`. Nunca edites una migración ya aplicada.
+- **`api.get/post/put/patch/del`** desde `apps/web/src/lib/api.ts`: inyecta el Bearer y lanza `ApiError(status, code, message)`.
+- **Identidad de cliente = E.164 normalizado**, en escritura *y* en búsqueda. Dos registros para una persona parten su historial.
+- **`z.strictObject` cuando el allowlist del body ES el punto del endpoint.** Con `z.object`, Zod descarta claves desconocidas: mandar `role` a `PATCH /api/me` devolvía 200 sin escribir nada. Seguro, pero le decía al cliente "guardado" cuando no había guardado.
+- **Tailwind: `brand` + `role.{admin,supervisor,soporte}`.** Los colores de rol se aplican como custom properties en `:root` desde `/api/role-colors`.
+- **`tsconfig.base.json`** activa `strict` + `noUncheckedIndexedAccess` + `noImplicitOverride`. El acceso a índices devuelve `T | undefined`.
 
 ## Critical caveats
 
-- **`apps/api/scripts/db.ts` connects with `DATABASE_URL` (Postgres superuser).** It bypasses RLS entirely. Never point it at a shared/prod DB, and never expose its argv to untrusted input. The web SPA does **not** touch this — it uses Supabase JS clients only.
-- **`apps/api/AGENTS.md` block is re-injected by `next dev`.** Don't manually delete it; the generator at `node_modules/next/dist/server/lib/generate-agent-files.js` recreates it. This Next.js 16 has breaking changes — read `node_modules/next/dist/docs/` before writing API code.
-- **README claims Twilio integration that doesn't yet exist in routes.** No outbound message sending or webhook handler is wired. Don't assume `apps/api/src/services/` knows about Twilio — it currently doesn't.
-- **Service-role key lives in `apps/api/.env`.** The admin Supabase client (`apps/api/src/lib/supabase/admin.ts`) uses it for trusted server-side queries that need to bypass RLS (e.g. resolving the current user). Treat it like a DB superuser.
-- **`tsconfig.base.json` enables `strict` + `noUncheckedIndexedAccess` + `noImplicitOverride`.** Array/object index access returns `T | undefined`. Don't silence these without a comment.
-- **`pnpm` v11 with workspaces.** Don't introduce `package-lock.json` or `yarn.lock`. The pnpm-only enforcement hook runs at session start.
+- **`apps/api/scripts/db.ts` y los smoke tests usan `DATABASE_URL` (superuser) y el service-role key.** Nunca los apuntes a una base compartida o de producción.
+- **Los E2E protegidos hacen `skip` si faltan `E2E_EMAIL`/`E2E_PASSWORD`.** Un "todo verde" puede ser 0 tests ejecutados. Un E2E que toque datos reales debe crear su propia fila y borrarla en `finally` — renombrar una fila de producción "funciona" y aun así destruye información.
+- **`next dev` reinyecta `apps/api/AGENTS.md`** en cada arranque; no lo borres a mano. Next.js 16 tiene breaking changes: lee `node_modules/next/dist/docs/` antes de escribir código de API.
+- **Stale dev servers.** `pnpm -r --parallel` no mata una instancia anterior. Antes de arrancar: `lsof -nP -iTCP:3000 -sTCP:LISTEN`. Matar solo la API no basta: la mitad web morirá igual con EADDRINUSE.
+- **Twilio: los webhooks son reales, el envío saliente no.** `POST /api/webhooks/twilio` valida firma HMAC-SHA1 y registra mensajes entrantes; `/status` actualiza estados por SID. **No hay llamada al SDK de Twilio** — nada envía realmente por WhatsApp todavía.
+- **`pnpm` v11 con workspaces.** No introduzcas `package-lock.json` ni `yarn.lock`.

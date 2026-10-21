@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { z } from 'zod'
-import { requireRole } from '@/lib/auth'
+import { requirePermission } from '@/lib/auth'
 import { parseJson, getQuery } from '@/lib/validate'
 import {
   listConversations,
@@ -13,6 +13,8 @@ const ListQuery = z.object({
   assigned_agent_id: z.string().uuid().optional(),
   status: z.enum(['open', 'pending', 'closed']).optional(),
   limit: z.coerce.number().int().min(1).max(200).optional(),
+  /** Soporte only: restrict to conversations they already took. */
+  mine: z.coerce.boolean().optional(),
 })
 
 const CreateBody = z.object({
@@ -20,7 +22,7 @@ const CreateBody = z.object({
 })
 
 export async function GET(request: Request) {
-  const auth = await requireRole(['admin', 'supervisor', 'soporte'], request)
+  const auth = await requirePermission(['conversation.read'], request)
   if ('error' in auth) return auth.error
 
   const parsed = ListQuery.safeParse(getQuery(request, {
@@ -38,8 +40,18 @@ export async function GET(request: Request) {
     )
   }
 
+  const filter = parsed.data
   try {
-    const data = await listConversations(parsed.data)
+    // W2: Soporte only sees the conversations they own, plus the unassigned
+    // queue so they can claim one. `mine=true` narrows to their own only.
+    const scope =
+      auth.user.role === 'soporte'
+        ? filter.mine
+          ? { assigned_agent_id: auth.user.id }
+          : { assigned_agent_id: auth.user.id, include_unassigned: true }
+        : filter
+
+    const data = await listConversations(scope)
     return NextResponse.json({ data })
   } catch (err) {
     return NextResponse.json(
@@ -58,7 +70,7 @@ export async function GET(request: Request) {
  * Production conversations are created automatically by the inbound webhook.
  */
 export async function POST(request: Request) {
-  const auth = await requireRole(['admin'], request)
+  const auth = await requirePermission(['conversation.assign'], request)
   if ('error' in auth) return auth.error
 
   const parsed = await parseJson(request, CreateBody)

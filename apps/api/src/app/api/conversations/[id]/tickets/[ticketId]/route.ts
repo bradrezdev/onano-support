@@ -1,11 +1,11 @@
 import { NextResponse } from 'next/server'
-import { requireRole } from '@/lib/auth'
+import { requirePermission } from '@/lib/auth'
 import { unlinkTicketFromConversation, LinkError } from '@/services/conversation-links'
 
 type Params = { params: Promise<{ id: string; ticketId: string }> }
 
 export async function DELETE(request: Request, ctx: Params) {
-  const auth = await requireRole(['admin', 'supervisor', 'soporte'], request)
+  const auth = await requirePermission(['ticket.assign'], request)
   if ('error' in auth) return auth.error
   const { id, ticketId } = await ctx.params
 

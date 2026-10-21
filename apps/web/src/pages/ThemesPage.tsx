@@ -42,7 +42,7 @@ export default function ThemesPage() {
     }
     if (
       !confirm(
-        `¿Eliminar el tema "${theme.name}"? Esta acción no se puede deshacer.`,
+        `¿Eliminar el proyecto "${theme.name}"? Esta acción no se puede deshacer.`,
       )
     )
       return
@@ -58,9 +58,9 @@ export default function ThemesPage() {
     <div className="space-y-4">
       <header className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-semibold text-slate-900">Temas</h1>
+          <h1 className="text-2xl font-semibold text-slate-900">Proyectos</h1>
           <p className="mt-1 text-sm text-slate-500">
-            Cada tema agrupa flujos por los que se mueven los tickets.
+            Cada proyecto agrupa las fases por las que se mueven los tickets.
           </p>
         </div>
         {isAdmin && (
@@ -73,7 +73,7 @@ export default function ThemesPage() {
             }}
           >
             <Plus size={16} />
-            Nuevo tema
+            Nuevo proyecto
           </button>
         )}
       </header>
@@ -89,7 +89,7 @@ export default function ThemesPage() {
       ) : themes.length === 0 ? (
         <div className="card flex flex-col items-center gap-2 p-8 text-center text-sm text-slate-500">
           <Palette size={32} className="text-slate-300" />
-          <p>Aún no hay temas.</p>
+          <p>Aún no hay proyectos.</p>
           {isAdmin && (
             <button
               type="button"
@@ -168,7 +168,7 @@ function ThemeCard({
               className="btn-ghost p-1"
               onClick={onEdit}
               title="Editar"
-              aria-label="Editar tema"
+              aria-label="Editar proyecto"
             >
               <Pencil size={14} />
             </button>
@@ -177,7 +177,7 @@ function ThemeCard({
               className="btn-ghost p-1 text-slate-400 hover:text-red-600"
               onClick={onDelete}
               title="Eliminar"
-              aria-label="Eliminar tema"
+              aria-label="Eliminar proyecto"
             >
               <Trash2 size={14} />
             </button>
@@ -278,7 +278,7 @@ function ThemeFormModal({
         onClick={(e) => e.stopPropagation()}
       >
         <h2 className="text-lg font-semibold text-slate-900">
-          {editing ? `Editar "${editing.name}"` : 'Nuevo tema'}
+          {editing ? `Editar "${editing.name}"` : 'Nuevo proyecto'}
         </h2>
         <form className="mt-4 space-y-3" onSubmit={submit}>
           <div>
@@ -312,7 +312,7 @@ function ThemeFormModal({
                 value={color}
                 onChange={(e) => setColor(e.target.value)}
                 className="h-9 w-12 cursor-pointer rounded border border-slate-200"
-                aria-label="Color del tema"
+                aria-label="Color del proyecto"
               />
               <input
                 type="text"

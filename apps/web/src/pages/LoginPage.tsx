@@ -51,17 +51,30 @@ export default function LoginPage() {
 
         <form className="space-y-3" onSubmit={onSubmit}>
           {mode === 'signup' && (
-            <input
-              type="text"
-              required
-              placeholder="Nombre"
-              className="input"
-              value={displayName}
-              onChange={(e) => setDisplayName(e.target.value)}
-              autoComplete="name"
-            />
+            <>
+              {/* Real labels, not placeholders. A placeholder disappears the
+                  moment you type and is not reliably announced, so the field
+                  loses its name exactly when the user is filling it in. */}
+              <label htmlFor="login-name" className="sr-only">
+                Nombre
+              </label>
+              <input
+                id="login-name"
+                type="text"
+                required
+                placeholder="Nombre"
+                className="input"
+                value={displayName}
+                onChange={(e) => setDisplayName(e.target.value)}
+                autoComplete="name"
+              />
+            </>
           )}
+          <label htmlFor="login-email" className="sr-only">
+            Correo
+          </label>
           <input
+            id="login-email"
             type="email"
             required
             placeholder="Correo"
@@ -70,7 +83,11 @@ export default function LoginPage() {
             onChange={(e) => setEmail(e.target.value)}
             autoComplete="email"
           />
+          <label htmlFor="login-password" className="sr-only">
+            Contraseña
+          </label>
           <input
+            id="login-password"
             type="password"
             required
             minLength={6}

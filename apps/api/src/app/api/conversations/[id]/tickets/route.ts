@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { z } from 'zod'
-import { requireRole } from '@/lib/auth'
+import { requirePermission } from '@/lib/auth'
 import { parseJson } from '@/lib/validate'
 import { listLinkedTickets, linkTicketToConversation, LinkError } from '@/services/conversation-links'
 
@@ -11,7 +11,7 @@ const LinkBody = z.object({
 })
 
 export async function GET(request: Request, ctx: Params) {
-  const auth = await requireRole(['admin', 'supervisor', 'soporte'], request)
+  const auth = await requirePermission(['conversation.read'], request)
   if ('error' in auth) return auth.error
   const { id } = await ctx.params
 
@@ -31,7 +31,7 @@ export async function GET(request: Request, ctx: Params) {
  * PK (conversation_id, ticket_id). Multiple tickets per conversation allowed.
  */
 export async function POST(request: Request, ctx: Params) {
-  const auth = await requireRole(['admin', 'supervisor', 'soporte'], request)
+  const auth = await requirePermission(['ticket.create'], request)
   if ('error' in auth) return auth.error
   const { id } = await ctx.params
 

@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { requireRole } from '@/lib/auth'
+import { requirePermission } from '@/lib/auth'
 import { listLinkedConversations } from '@/services/conversation-links'
 
 type Params = { params: Promise<{ id: string }> }
@@ -8,7 +8,7 @@ type Params = { params: Promise<{ id: string }> }
  * List conversations linked to this ticket. Multiple allowed.
  */
 export async function GET(request: Request, ctx: Params) {
-  const auth = await requireRole(['admin', 'supervisor', 'soporte'], request)
+  const auth = await requirePermission(['ticket.read'], request)
   if ('error' in auth) return auth.error
   const { id } = await ctx.params
 

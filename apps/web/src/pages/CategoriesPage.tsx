@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react'
 import { useAuthStore } from '@/stores/auth'
 import { api, ApiError } from '@/lib/api'
-import { ChevronRight, Plus, Folder, FolderOpen, Trash2 } from 'lucide-react'
+import { ChevronRight, Plus, Folder, FolderOpen, Trash2, Pencil, X, Check } from 'lucide-react'
 import clsx from 'clsx'
+import { canWith } from '@/lib/permissions'
 
 interface Category {
   id: string
@@ -14,13 +15,20 @@ interface Category {
 
 export default function CategoriesPage() {
   const profile = useAuthStore((s) => s.profile)
-  const isAdmin = profile?.role === 'admin'
+  // Permission keys, not the legacy role column: each route already gates on a
+  // specific key, so a custom role that holds `category.update` must be able
+  // to rename here too. Checking `role === 'admin'` would hide the button from
+  // exactly the people the backend would let through.
+  const canCreate = canWith(profile, 'category.create')
+  const canUpdate = canWith(profile, 'category.update')
+  const canDelete = canWith(profile, 'category.delete')
 
   const [tree, setTree] = useState<Category[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [formOpen, setFormOpen] = useState(false)
   const [formParent, setFormParent] = useState<Category | null>(null)
+  const [rowError, setRowError] = useState<string | null>(null)
 
   async function load() {
     setLoading(true)
@@ -38,6 +46,24 @@ export default function CategoriesPage() {
   useEffect(() => {
     void load()
   }, [])
+
+  /**
+   * Rename in place. A duplicate name at the same level comes back as 409 and
+   * is shown on the row that caused it — a global banner would leave the user
+   * guessing which of a dozen rows is complaining.
+   */
+  async function handleRename(cat: Category, name: string) {
+    const trimmed = name.trim()
+    if (!trimmed || trimmed === cat.name) return
+    setRowError(null)
+    try {
+      await api.patch(`/api/categories/${cat.id}`, { name: trimmed })
+      await load()
+    } catch (err) {
+      setRowError((err as ApiError).message)
+      throw err
+    }
+  }
 
   async function handleDelete(cat: Category) {
     if (cat.children.length > 0) {
@@ -62,7 +88,7 @@ export default function CategoriesPage() {
             Taxonomía usada para clasificar tickets. Dos niveles: categoría + sub-categoría.
           </p>
         </div>
-        {isAdmin && (
+        {canCreate && (
           <button
             type="button"
             className="btn-primary"
@@ -83,13 +109,19 @@ export default function CategoriesPage() {
         </div>
       )}
 
+      {rowError && (
+        <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+          {rowError}
+        </div>
+      )}
+
       {loading ? (
         <div className="card p-6 text-sm text-slate-500">Cargando…</div>
       ) : tree.length === 0 ? (
         <div className="card flex flex-col items-center gap-2 p-8 text-center text-sm text-slate-500">
           <Folder size={32} className="text-slate-300" />
           <p>Aún no hay categorías.</p>
-          {isAdmin && (
+          {canCreate && (
             <button
               type="button"
               className="btn-primary mt-2"
@@ -109,12 +141,15 @@ export default function CategoriesPage() {
               key={cat.id}
               cat={cat}
               depth={0}
-              isAdmin={isAdmin}
+              canUpdate={canUpdate}
+              canDelete={canDelete}
+              canCreate={canCreate}
               onAddSub={(c) => {
                 setFormParent(c)
                 setFormOpen(true)
               }}
               onDelete={handleDelete}
+              onRename={handleRename}
             />
           ))}
         </div>
@@ -137,18 +172,49 @@ export default function CategoriesPage() {
 function CategoryRow({
   cat,
   depth,
-  isAdmin,
+  canUpdate,
+  canDelete,
+  canCreate,
   onAddSub,
   onDelete,
+  onRename,
 }: {
   cat: Category
   depth: number
-  isAdmin: boolean
+  canUpdate: boolean
+  canDelete: boolean
+  canCreate: boolean
   onAddSub: (c: Category) => void
   onDelete: (c: Category) => void
+  onRename: (c: Category, name: string) => Promise<void>
 }) {
   const [open, setOpen] = useState(depth === 0)
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(cat.name)
+  const [saving, setSaving] = useState(false)
   const hasChildren = cat.children.length > 0
+
+  function startEdit() {
+    setDraft(cat.name)
+    setEditing(true)
+  }
+
+  async function commit() {
+    if (!draft.trim() || draft.trim() === cat.name) {
+      setEditing(false)
+      return
+    }
+    setSaving(true)
+    try {
+      await onRename(cat, draft)
+      setEditing(false)
+    } catch {
+      // The parent already surfaced the message; stay in edit mode so the
+      // typed name is not lost.
+    } finally {
+      setSaving(false)
+    }
+  }
 
   return (
     <div>
@@ -179,31 +245,90 @@ function CategoryRow({
         ) : (
           <Folder size={16} className="text-amber-500" />
         )}
+
         <div className="flex-1">
-          <div className="font-medium text-slate-900">{cat.name}</div>
+          {editing ? (
+            <div className="flex items-center gap-1">
+              <input
+                autoFocus
+                type="text"
+                maxLength={120}
+                aria-label={`Nuevo nombre para ${cat.name}`}
+                className="input text-sm"
+                value={draft}
+                disabled={saving}
+                onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault()
+                    void commit()
+                  }
+                  if (e.key === 'Escape') setEditing(false)
+                }}
+              />
+              <button
+                type="button"
+                className="btn-ghost px-2 py-1 text-emerald-700"
+                onClick={() => void commit()}
+                disabled={saving || !draft.trim()}
+                aria-label="Guardar nombre"
+                title="Guardar"
+              >
+                <Check size={14} />
+              </button>
+              <button
+                type="button"
+                className="btn-ghost px-2 py-1 text-slate-400"
+                onClick={() => setEditing(false)}
+                disabled={saving}
+                aria-label="Cancelar"
+                title="Cancelar"
+              >
+                <X size={14} />
+              </button>
+            </div>
+          ) : (
+            <div className="font-medium text-slate-900">{cat.name}</div>
+          )}
           {cat.description && (
             <div className="text-xs text-slate-500">{cat.description}</div>
           )}
         </div>
-        {isAdmin && (
+
+        {(canUpdate || canDelete || canCreate) && (
           <div className="flex items-center gap-1">
-            <button
-              type="button"
-              className="btn-ghost px-2 py-1 text-xs"
-              onClick={() => onAddSub(cat)}
-              title="Añadir sub-categoría"
-            >
-              <Plus size={14} />
-              Sub
-            </button>
-            <button
-              type="button"
-              className="btn-ghost px-2 py-1 text-xs text-slate-400 hover:text-red-600"
-              onClick={() => onDelete(cat)}
-              title="Eliminar"
-            >
-              <Trash2 size={14} />
-            </button>
+            {canCreate && (
+              <button
+                type="button"
+                className="btn-ghost px-2 py-1 text-xs"
+                onClick={() => onAddSub(cat)}
+                title="Añadir sub-categoría"
+              >
+                <Plus size={14} />
+                Sub
+              </button>
+            )}
+            {canUpdate && !editing && (
+              <button
+                type="button"
+                className="btn-ghost px-2 py-1 text-xs text-slate-400 hover:text-slate-700"
+                onClick={startEdit}
+                title="Renombrar"
+                aria-label={`Renombrar ${cat.name}`}
+              >
+                <Pencil size={14} />
+              </button>
+            )}
+            {canDelete && (
+              <button
+                type="button"
+                className="btn-ghost px-2 py-1 text-xs text-slate-400 hover:text-red-600"
+                onClick={() => onDelete(cat)}
+                title="Eliminar"
+              >
+                <Trash2 size={14} />
+              </button>
+            )}
           </div>
         )}
       </div>
@@ -214,9 +339,12 @@ function CategoryRow({
               key={sub.id}
               cat={sub}
               depth={depth + 1}
-              isAdmin={isAdmin}
+              canUpdate={canUpdate}
+              canDelete={canDelete}
+              canCreate={canCreate}
               onAddSub={onAddSub}
               onDelete={onDelete}
+              onRename={onRename}
             />
           ))}
         </div>

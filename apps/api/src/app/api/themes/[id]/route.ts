@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { z } from 'zod'
-import { requireRole } from '@/lib/auth'
+import { requirePermission } from '@/lib/auth'
 import { parseJson } from '@/lib/validate'
 import { updateTheme, deleteTheme, ThemeError } from '@/services/themes'
 
@@ -13,7 +13,7 @@ const ThemePatch = z.object({
 type Params = { params: Promise<{ id: string }> }
 
 export async function PATCH(request: Request, ctx: Params) {
-  const auth = await requireRole(['admin'], request)
+  const auth = await requirePermission(['theme.create'], request)
   if ('error' in auth) return auth.error
   const { id } = await ctx.params
 
@@ -38,7 +38,7 @@ export async function PATCH(request: Request, ctx: Params) {
 }
 
 export async function DELETE(request: Request, ctx: Params) {
-  const auth = await requireRole(['admin'], request)
+  const auth = await requirePermission(['theme.delete'], request)
   if ('error' in auth) return auth.error
   const { id } = await ctx.params
 

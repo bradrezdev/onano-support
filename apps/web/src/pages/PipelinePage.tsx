@@ -121,7 +121,7 @@ export default function PipelinePage() {
       ) : themes.length === 0 ? (
         <div className="card flex flex-col items-center gap-2 p-8 text-center text-sm text-slate-500">
           <Inbox size={32} className="text-slate-300" />
-          <p>No hay temas. Crea al menos uno en /themes.</p>
+          <p>No hay proyectos. Crea al menos uno en Proyectos.</p>
         </div>
       ) : (
         <DndContext
@@ -204,7 +204,7 @@ function ThemeRow({
         })}
         {theme.flows.length === 0 && (
           <div className="card p-4 text-sm text-slate-500">
-            Este tema aún no tiene flujos.
+            Este proyecto aún no tiene fases.
           </div>
         )}
       </div>

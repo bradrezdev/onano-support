@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { z } from 'zod'
-import { requireRole } from '@/lib/auth'
+import { requirePermission } from '@/lib/auth'
 import { parseJson, getQuery } from '@/lib/validate'
 import { createSupabaseAdminClient } from '@/lib/supabase/admin'
 import { listCategoryTree, findCategoryById } from '@/services/categories'
@@ -12,7 +12,7 @@ const CategoryCreate = z.object({
 })
 
 export async function GET(request: Request) {
-  const auth = await requireRole(['admin', 'supervisor', 'soporte'], request)
+  const auth = await requirePermission(['conversation.read'], request)
   if ('error' in auth) return auth.error
 
   const q = getQuery<{ flat?: boolean }>(request, {
@@ -39,7 +39,7 @@ export async function GET(request: Request) {
 }
 
 export async function POST(request: Request) {
-  const auth = await requireRole(['admin'], request)
+  const auth = await requirePermission(['category.create'], request)
   if ('error' in auth) return auth.error
 
   const parsed = await parseJson(request, CategoryCreate)
