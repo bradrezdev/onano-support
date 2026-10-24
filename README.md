@@ -1,120 +1,390 @@
-# WhatsApp CRM
+# WhatsApp CRM — ONANO Global
 
-CRM de WhatsApp multi-usuario: gestiona contactos, conversaciones, asignación a agentes, pipeline de leads, etiquetas y notas. Backend en Node.js + Fastify, base de datos en Supabase (Postgres + Auth + Realtime + Storage), envío de mensajes vía Twilio, frontend en Vue 3 + Vite + Tailwind.
+CRM interno para gestionar incidencias (pagos, registros, movimientos de red, envíos) ligadas a clientes, y para atender conversaciones de WhatsApp en equipo.
+
+Los **clientes** no inician sesión: son registros de control interno. Los **usuarios** del sistema son Admin, Supervisor y Soporte, más los roles personalizados que un Admin crea desde la UI.
+
+---
+
+## Índice
+
+- [Stack](#stack)
+- [Arquitectura](#arquitectura)
+- [Base de datos](#base-de-datos)
+- [Roles y permisos](#roles-y-permisos)
+- [Twilio](#twilio)
+- [Puesta en marcha](#puesta-en-marcha)
+- [Flujo de trabajo](#flujo-de-trabajo)
+- [Verificación](#verificacion)
+- [Estructura del repositorio](#estructura-del-repositorio)
+- [Consideraciones operativas](#consideraciones-operativas)
+
+---
 
 ## Stack
 
-- **Backend**: Node 18+, TypeScript, Fastify, Twilio SDK, Supabase JS, Zod
-- **Frontend**: Vue 3, Vite, Tailwind v3, Pinia, vue-router, Supabase JS
-- **DB**: Supabase Postgres con Auth, Realtime y Storage
-- **Mensajería**: Twilio WhatsApp (webhooks + REST)
-- **Package manager**: pnpm con workspaces
+| Capa | Tecnología |
+|---|---|
+| **API** | Next.js 16.4.2 (App Router) · TypeScript strict · Zod 4 · puerto 3000 |
+| **Web** | React 19 · Vite · Tailwind v3 · Zustand · React Router v6 · puerto 5173 |
+| **Datos** | Supabase (Postgres + Auth + Realtime + Storage) |
+| **Mensajería** | Twilio WhatsApp (webhooks entrantes + estados) |
+| **Paquetes** | pnpm v11 con workspaces |
+| **Tests** | Vitest 2 (unit + integración) · Playwright (E2E) · smoke scripts contra la DB real |
 
-## Estructura
+**Una regla estructural:** el SPA nunca habla con Postgres. Todo pasa por la API, que es la única que conoce el esquema.
+
+---
+
+## Arquitectura
 
 ```
-.
-├── apps/
-│   ├── api/      # Fastify backend
-│   └── web/      # Vue 3 + Vite frontend
-├── supabase/
-│   └── migrations/   # SQL migrations para Supabase
-├── scripts/         # utilidades (seeds, bootstrap admin)
-├── pnpm-workspace.yaml
-├── tsconfig.base.json
-└── package.json
+┌─────────────────┐        Authorization: Bearer <jwt>        ┌──────────────────┐
+│  apps/web       │ ────────────────────────────────────────▶ │  apps/api        │
+│  React 19 SPA   │ ◀──────────────────────────────────────── │  Next.js 16      │
+│                 │         JSON + ApiError(status, code)      │  42 route        │
+│  Zustand store  │                                           │  handlers        │
+│  apiFetch()     │                                           │        │         │
+└─────────────────┘                                           │        ▼         │
+                                                              │  src/services/   │
+                                                              │  lógica + SQL    │
+                                                              └────────┬─────────┘
+                                                                       │
+                                                        service_role │ (BYPASSES RLS)
+                                                                       ▼
+                                                              ┌──────────────────┐
+                                                              │  Supabase       │
+                                                              │  Postgres + Auth│
+                                                              └──────────────────┘
 ```
 
-## Setup inicial
+**Las tres capas y qué les corresponde:**
 
-### 1. Supabase
+| Capa | Responsabilidad | No debe |
+|---|---|---|
+| `apps/web/src/pages` | Render, interacción, estado de UI | Hablar con Supabase directamente |
+| `apps/api/src/app/api` | Validar entrada (Zod), traducir a status codes, chequear permisos | Ejecutar queries |
+| `apps/api/src/services` | Toda la lógica de negocio y las queries | Saber de HTTP |
 
-1. Crear proyecto en https://supabase.com
-2. Ir a **Settings → API** y copiar `URL` + `anon public` + `service_role` (esta última solo para el backend)
-3. Abrir **SQL Editor** y ejecutar las migrations en orden desde `supabase/migrations/`:
-   - `20251016000000_init.sql`
-   - `20251016000001_rls.sql`
-   - `20251016000002_triggers.sql`
-   - `20251016000003_storage.sql`
-4. Crear primer usuario vía signup en la app, luego promoverlo a admin en SQL:
-   ```sql
-   update profiles set role = 'admin' where id = '<uuid>';
-   ```
+Los servicios lanzan errores tipados (`TicketValidationError`, `ThemeError`, `RoleValidationError`, `UserValidationError`, `ConversationError`, `AttachmentError`, `LinkError`) con `status` + `code`. Las rutas los traducen. Una validación que devuelve 400 desde el servicio es un acierto: el error de negocio y el de transporte se mantienen separados.
 
-### 2. Twilio
+---
 
-1. Crear cuenta en https://console.twilio.com
-2. **Developement → Messaging → Try WhatsApp → Sandbox**
-3. Configurar webhook en el sandbox:
-   - "WHEN A MESSAGE COMES IN" → `https://<tu-tunnel>/api/webhooks/twilio` (POST)
-   - "STATUS CALLBACK URL" → `https://<tu-tunnel>/api/webhooks/twilio/status` (POST)
-4. Anotar `ACCOUNT_SID`, `AUTH_TOKEN` y el número sandbox (`+14155238886`).
+## Base de datos
 
-### 3. Local
+Postgres de Supabase, 24 tablas, esquema 100% en SQL (no Prisma ni Drizzle). La migración se aplica con `db:migrate`, que corre los archivos de `supabase/migrations/` en orden y es idempotente.
+
+### Dominio: identidad y permisos
+
+| Tabla | Propósito |
+|---|---|
+| `profiles` | Una fila por usuario. `role_key` apunta al rol; `role` es la columna legacy sincronizada solo para los tres slugs del sistema |
+| `roles` | Catálogo de roles. `key` es el slug estable; `is_system` marca los tres que no se pueden borrar |
+| `permissions` | Catálogo de 34 llaves de permiso, con `label` y `group_name` |
+| `role_permissions` | Keyring: qué rol tiene qué llave. many-to-many con `granted_by` |
+| `role_color_settings` | Color y desvanecido por rol, para las burbujas de los mensajes |
+
+### Dominio: clientes y conversaciones
+
+| Tabla | Propósito |
+|---|---|
+| `contacts` | Clientes. `whatsapp_number` en E.164 y único; búsqueda por nombre con índice trigram (`gin_trgm_ops`) |
+| `tags` / `contact_tags` | Etiquetas de cliente (many-to-many) |
+| `conversations` | Hilo de WhatsApp por cliente. `assigned_agent_id`, `escalated_to_id`, contador de no leídos |
+| `messages` | Mensajes de WhatsApp. `twilio_sid` para correlacionar con Twilio |
+| `conversation_tickets` |many-to-many entre conversación y ticket |
+| `notes` | Notas internas, optionally ancladas a un cliente o a una conversación |
+| `pipeline_stages` / `conversation_stages` | **Reservadas, sin uso.** 0 filas y 0 referencias en el código |
+
+### Dominio: proyectos y tickets
+
+| Tabla | Propósito |
+|---|---|
+| `themes` | Proyectos. Agrupan fases |
+| `flows` | Fases de un proyecto. `is_terminal` marca la fase de cierre; `group_key` mapea a un grupo compartido |
+| `flow_groups` | Vocabulario compartido: `pendiente`, `en_trabajo`, `en_espera`, `terminado` |
+| `categories` | Taxonomía de dos niveles (`parent_id` self-referente) |
+| `tickets` | 22 columnas: cliente, categoría, proyecto, fase, asignado, estado, prioridad, `due_at`, `is_major`, `deleted_at` |
+| `ticket_messages` | Respuestas internas dentro del ticket (distinto de `messages`, que es WhatsApp) |
+| `ticket_message_attachments` | many-to-many que fija un mensaje de WhatsApp a un ticket como evidencia |
+| `ticket_history` | Auditoría append-only: actor, acción, payload |
+
+### Mecanismos que no se ven en el esquema
+
+**Triggers.** La base hace trabajo que el código no tiene que hacer:
+
+| Trigger | Efecto |
+|---|---|
+| `handle_new_user` | Al crear un usuario en Auth, inserta su fila en `profiles` con `display_name` derivado del email y `role='soporte'`. **El servicio actualiza esa fila, nunca la inserta** — insertarla viola `profiles_pkey` |
+| `roles_protect_system` / `roles_protect_key` | Impiden borrar los roles del sistema y renombrar su `key` (referenciado por `profiles.role_key` y `role_color_settings.role`) |
+| `*_touch_updated_at` | Mantienen `updated_at` en `contacts`, `categories`, `themes`, `flows`, `tickets` |
+| `messages_bump_conversation` | Actualiza la conversación al llegar un mensaje |
+| `conversations_reset_unread_on_assign` | Al asignar una conversación, reinicia el contador de no leídos |
+
+**Funciones.**
+
+| Función | Para qué |
+|---|---|
+| `resolve_permissions(p_profile_id)` | Resuelve el keyring completo de un usuario en un viaje. Es lo que consume `/api/me` |
+| `ticket_history_is_append_only()` | Aserta la invariante del historial |
+| `current_user_role_safe()` | Acceso al rol desde SQL sin filtrar filas |
+
+**RLS: por qué hay `REVOKE` y no solo políticas.** El cliente `service_role` **bypasea RLS** — es la única credencial que usa la API. Una política RLS no protege nada contra él. La defensa real es a nivel de privilegio: `ticket_history` es append-only porque tiene
+
+```sql
+revoke update, delete, truncate on public.ticket_history from service_role;
+grant select, insert on public.ticket_history to service_role;
+```
+
+La app solo hace `INSERT` ahí, así que el candado no le cuesta nada y ni siquiera la propia service key puede reescribir el historial. Si añades una restricción de escritura, revoca el privilegio: una política sola es decorativa.
+
+**Soft delete.** `deleted_at` es un eje aparte de `status`. Las listas de trabajo filtran `.is('deleted_at', null)`; la papelera usa `.not(...)`. Los índices son parciales sobre las filas vivas.
+
+---
+
+## Roles y permisos
+
+**El modelo: los permisos son datos, los roles son conjuntos de llaves.**
+
+`public.permissions` es el catálogo de 34 llaves. `public.roles` agrupa esas llaves en un keyring. `profiles.role_key` apunta a un rol por slug. `resolve_permissions()` resuelve el keyring de un usuario en un viaje y `/api/me` lo entrega al SPA.
+
+Un rol sin llaves es una **respuesta válida, no un fallo**: existe, se ve vacío, y el Admin lo llena. Nunca se degrada a "sin permisos = todo permitido".
+
+### Catálogo de permisos (34 llaves en 6 grupos)
+
+**Cuentas** — `admin.createUser` · `admin.suspendUser` · `admin.deleteUser` · `admin.assignRole` · `admin.manageRoles` · `admin.viewAudit` · `admin.viewAccounts`
+
+**Clientes** — `contact.read` · `contact.create` · `contact.update` · `contact.delete`
+
+**Categorías** — `category.create` · `category.update` · `category.delete` · `subcategory.create` · `subcategory.delete`
+
+**Proyectos** — `theme.create` · `theme.delete` · `flow.create` · `flow.delete`
+
+**Tickets** — `ticket.read` · `ticket.create` · `ticket.update` · `ticket.assign` · `ticket.close` · `ticket.reopen` · `ticket.moveFlow` · `ticket.reply` · `ticket.delete` · `ticket.markMajor`
+
+**Conversaciones** — `conversation.read` · `conversation.assign` · `conversation.reassign` · `conversation.escalate`
+
+### Roles precargados
+
+| Rol | Sistema | Alcance |
+|---|---|---|
+| **Admin** | sí | Las 34 llaves. Acceso total, incluida auditoría y gestión de roles |
+| **Supervisor** | sí | Opera el equipo: asigna, reabre, reasigna, mueve en el pipeline, marca incidencias mayores. Crea y edita categorías y proyectos, crea fases, gestiona clientes. **No** borra categorías, proyectos ni fases, y no toca cuentas ni auditoría |
+| **Soporte** | sí | Atiende lo que toma: crea, edita y responde tickets, ve y responde conversaciones, pide apoyo, ve y crea clientes. No asigna, no cierra, no reabre |
+| **Auditor** | no | Solo lectura de auditoría y respuesta en tickets. Creado desde la UI en `/roles` |
+
+### El color vive en dos tablas
+
+`roles.color` pinta los badges; `role_color_settings.base_color` pinta las burbujas de los mensajes, vía custom properties CSS (`--role-admin`). El espejo bidireccional está en los **servicios**, no en la UI, para que cualquier ruta que toque el color deje las dos alineadas — ya divergieron una vez (`admin` tenía `#5692ff` en una y `#85baff` en la otra). Un rol personalizado solo alcanza `roles`; la UI lo dice en vez de mostrar un color que aparenta estar vivo.
+
+### Reglas de enforcement
+
+- **Todo se verifica en el backend.** Ocultar un botón es un letrero sin puerta: cada ruta llama `requirePermission`, así que una petición fabricada se rechaza sin importar qué pinte el SPA.
+- **Mezclar campos con permisos distintos en un `PATCH` exige la llave exacta de lo que toca.** En `PATCH /api/tickets/:id`: renombrar es `ticket.update`, reasignar es `ticket.assign`, mover de fase es `ticket.moveFlow`. Pedir la unión dejaría que quien solo puede renombrar también reasigne.
+- **Un keyring vacío no hereda los poderes de la columna legacy.** El cliente decide por `permissions != null` ("¿ya llegó el keyring?"), nunca por `length > 0` — esa comprobación le regalaría a un rol recién creado todos los poderes de su `role` heredada.
+
+---
+
+## Twilio
+
+### Variables de entorno
+
+| Variable | Para qué | Estado |
+|---|---|---|
+| `TWILIO_ACCOUNT_SID` | Identificador de la cuenta | Configurada; **sin uso en código** |
+| `TWILIO_AUTH_TOKEN` | Verificación de firma HMAC-SHA1 | **En uso** |
+| `TWILIO_WHATSAPP_FROM` | Número emisor | Configurada; **sin uso en código** |
+| `WEBHOOK_BASE_URL` | URL pública para validar la firma | Configurada; **sin uso en código** |
+
+### Webhooks
+
+| Ruta | Método | Qué hace |
+|---|---|---|
+| `/api/webhooks/twilio` | POST | Mensajes entrantes. Valida firma, busca el cliente por `From`, crea la conversación si hace falta y registra el mensaje |
+| `/api/webhooks/twilio/status` | POST | Estados de entrega (`queued`, `sent`, `delivered`, `read`, `failed`), correlacionados por `MessageSid` |
+
+Para configurarlos en la consola de Twilio, apuntá el webhook de mensajes a `https://<tu-dominio>/api/webhooks/twilio` (método POST) y el de estados a `https://<tu-dominio>/api/webhooks/twilio/status`.
+
+### Validación de firma
+
+Implementada a mano, sin el paquete `twilio` oficial (`src/lib/twilio-signature.ts`): se concatena la URL completa con las claves y valores del POST ordenados alfabéticamente, se aplica HMAC-SHA1 con el Auth Token, se codifica en base64 y se compara en **tiempo constante** contra `X-Twilio-Signature`. Si `TWILIO_AUTH_TOKEN` no está definida, la validación se salta (modo desarrollo) — en producción debe estar definida.
+
+### Qué NO está cableado
+
+- **No hay envío saliente.** No existe una llamada al SDK de Twilio: nada manda por WhatsApp todavía. `appendOutboundMessage` registra el mensaje en la base pero no lo transmite.
+- **La firma se valida contra `request.url`**, que detrás de un proxy es la URL interna, no la pública. `WEBHOOK_BASE_URL` existe en el `.env` justamente para esto y aún no se usa: **si despliegas detrás de un reverse proxy, la validación va a fallar hasta que se use**. Es el pendiente #1 de Twilio.
+- Los webhooks respondieron **siempre 200**, incluso al fallar el procesamiento, para que Twilio no reintente en bucle. Los errores se registran en el log.
+
+---
+
+## Puesta en marcha
+
+### Requisitos
+
+Node 22+, pnpm v11, y un proyecto Supabase (Postgres + Auth).
+
+### 1. Dependencias
 
 ```bash
-cd whatsapp-CRM
 pnpm install
-
-# Crear .env a partir de los ejemplos
-cp .env.example apps/api/.env       # rellenar con valores Supabase + Twilio + WEBHOOK_BASE_URL
-cp apps/web/.env.example apps/web/.env   # rellenar con VITE_SUPABASE_URL + ANON_KEY
-
-# Arrancar api (:4000) y web (:5173) en paralelo
-pnpm dev
-
-# En otra terminal, exponer el webhook público con ngrok
-ngrok http 4000
-# Copia la URL https://xxxx.ngrok-free.app a WEBHOOK_BASE_URL y a la config del sandbox de Twilio
 ```
 
-## Scripts útiles
+### 2. Variables de entorno
 
-| Comando | Qué hace |
-|---|---|
-| `pnpm dev` | Arranca api y web en paralelo |
-| `pnpm dev:api` | Solo el backend (Fastify en :4000) |
-| `pnpm dev:web` | Solo el frontend (Vite en :5173) |
-| `pnpm build` | Build de producción de ambas apps |
-| `pnpm typecheck` | Verifica tipos en todo el monorepo |
-| `pnpm clean` | Borra `dist/`, `node_modules/`, `.vite/` |
+`apps/api/.env`:
 
-## Variables de entorno
+```bash
+SUPABASE_URL=https://<proyecto>.supabase.co
+SUPABASE_SECRET_KEY=<service_role>       # backend only — nunca en el navegador
+DATABASE_URL=postgresql://...            # para scripts/db.ts (superuser)
 
-### `apps/api/.env`
-
-```
-PORT=4000
-HOST=0.0.0.0
-NODE_ENV=development
-LOG_LEVEL=info
-CORS_ORIGIN=http://localhost:5173
-
-SUPABASE_URL=
-SUPABASE_ANON_KEY=
-SUPABASE_SERVICE_ROLE_KEY=
-
-TWILIO_ACCOUNT_SID=
-TWILIO_AUTH_TOKEN=
-TWILIO_WHATSAPP_NUMBER=
-
-WEBHOOK_BASE_URL=     # p.ej. https://xxxx.ngrok-free.app
+TWILIO_ACCOUNT_SID=AC...
+TWILIO_AUTH_TOKEN=...
+TWILIO_WHATSAPP_FROM=+52...
+WEBHOOK_BASE_URL=https://<tu-dominio>
 ```
 
-### `apps/web/.env`
+`apps/web/.env`:
+
+```bash
+VITE_API_BASE_URL=http://localhost:3000
+NEXT_PUBLIC_SUPABASE_URL=https://<proyecto>.supabase.co
+NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=<publishable key>
+```
+
+`.env` y `.env.local` están en `.gitignore` a nivel de repo. Nunca los commitees.
+
+### 3. Esquema
+
+```bash
+pnpm --filter @crm/api db:migrate
+```
+
+Aplica las 20 migraciones en orden. Es idempotente: volver a correrlo no rompe nada.
+
+### 4. Primer usuario
+
+El trigger `handle_new_user` crea el perfil de cualquiera que se registre, siempre como `soporte`. Para el primer Admin, creá el usuario desde la consola de Supabase (Authentication → Users) y después:
+
+```bash
+pnpm --filter @crm/api db:exec \
+  "update profiles set role_key='admin', role='admin' where id='<uuid-del-usuario>';"
+```
+
+### 5. Arrancar
+
+```bash
+pnpm dev          # API :3000 + Web :5173 en paralelo
+```
+
+---
+
+## Flujo de trabajo
+
+### Comandos
+
+```bash
+pnpm install / dev / dev:api / dev:web
+pnpm build         # tsc -b + next build + vite build
+pnpm typecheck     # tsc --noEmit en ambos workspaces
+pnpm test          # vitest run en api y web
+pnpm clean
+```
+
+### Tests
+
+```bash
+pnpm --filter @crm/api test src/services/users.test.ts   # un archivo
+pnpm --filter @crm/api test -t "createUser"               # un caso
+pnpm --filter @crm/web test:e2e                           # Playwright
+pnpm --filter @crm/web lint                               # oxlint
+```
+
+Los E2E protegidos hacen **skip silencioso** si faltan `E2E_EMAIL` y `E2E_PASSWORD`. Un "todo verde" puede ser cero tests ejecutados:
+
+```bash
+E2E_EMAIL=... E2E_PASSWORD=... pnpm --filter @crm/web test:e2e
+```
+
+### Base de datos
+
+```bash
+pnpm --filter @crm/api db:migrate              # aplicar migraciones
+pnpm --filter @crm/api db:exec "<SQL>"        # una sentencia o ./ruta.sql
+pnpm --filter @crm/api db:query <tabla>
+pnpm --filter @crm/api db:tables
+```
+
+### Convenciones
+
+- **El esquema es SQL.** Tabla o columna nueva → migración nueva (`<timestamp>_<nombre>.sql`) + `db:migrate`. Nunca edites una migración ya aplicada.
+- **Las rutas llaman a servicios, nunca a Supabase directo.**
+- **El cliente usa `api.get/post/put/patch/del`** de `apps/web/src/lib/api.ts`: inyecta el Bearer y lanza `ApiError(status, code, message)`.
+- **Identidad de cliente = E.164 normalizado**, en escritura *y* en búsqueda. Dos registros para una persona parten su historial.
+- **`z.strictObject` cuando el allowlist del body es el punto del endpoint.** Con `z.object`, Zod descarta claves desconocidas: mandar `role` a `PATCH /api/me` devolvía 200 sin escribir nada — seguro, pero mentiroso.
+- **Los cambios de esquema en el backend y en el cliente van en el mismo commit.** El cliente compila contra un contrato que el backend expone.
+- **El `PRODUCT_SPEC.md` es la fuente de verdad del alcance.** Antes de una tarea, leelo. Al terminarla, actualizá el estado de los requisitos afectados.
+
+---
+
+## Verificación
+
+El proyecto tiene tres niveles, y el tercero existe por una razón concreta.
+
+```bash
+cd apps/api
+pnpm tsx scripts/smoke-batch.ts    # servicios contra la DB real
+pnpm tsx scripts/smoke-http.ts     # route handlers sobre un JWT real
+pnpm tsx scripts/make-e2e-admin.ts # admin temporal para E2E (bórralo después)
+```
+
+**Por qué los smoke tests existen:** los unit tests mockean Supabase, y un mock no tiene triggers, ni columnas, ni constraints. En este proyecto eso ya encontró tres bugs que 355 tests unitarios dejaron pasar — entre ellos un `INSERT` duplicado contra `profiles` que **fallaría el 100% de las veces en producción** y que ningún mock podía detectar.
+
+`smoke-batch.ts` restaura lo que modifica. Los dos crean datos reales: nunca los corras contra una base compartida.
+
+**Estado actual:** 344 API + 34 web + 18 Playwright = **396 verde**. Build limpio.
+
+> `pnpm lint` sale con código 1: oxlint cuenta los warnings como fallo. Son 25 warnings en 17 archivos, **0 errores**, y la mayoría son preexistentes (`set-state-in-effect` y `exhaustive-deps` en el mismo patrón de carga de datos de casi todas las páginas). No es una regresión sin comparar contra `main` primero.
+
+---
+
+## Estructura del repositorio
 
 ```
-VITE_SUPABASE_URL=
-VITE_SUPABASE_ANON_KEY=
-VITE_API_BASE_URL=http://localhost:4000
+apps/
+  api/                      # Next.js 16 — App Router bajo src/app
+    src/app/api/            # 42 route handlers (tickets, conversations, users,
+                            #   roles, themes, categories, webhooks, me, dashboard…)
+    src/app/middleware.ts   # CORS — sin él el SPA ve "Load failed"
+    src/lib/                # auth.ts, permissions.ts, phone.ts, sanitize.ts,
+                            #   validate.ts, twilio-signature.ts, supabase/{server,admin}
+    src/services/           # lógica de negocio y queries (tickets, conversations,
+                            #   users, roles, themes, categories, audit, inbox, …)
+    scripts/                # db.ts (admin SQL) + smoke scripts
+  web/                      # React 19 + Vite
+    src/pages/              # Login, Dashboard, Inbox, ConversationDetail, Contacts,
+                            #   ContactDetail, Categories, Tickets, TicketNew,
+                            #   TicketDetail, Pipeline, Themes, FlowEditor, Users,
+                            #   UserDetail, Roles, RoleColors, Audit, Trash, Profile
+    src/components/         # layout/ (AppShell, Sidebar, Topbar, ProtectedRoute,
+                            #   RoleGuard) · ui/ (RichTextEditor)
+    src/lib/                # api.ts, permissions.ts, roleColors.ts, themes.ts, users.ts
+    src/stores/auth.ts      # Zustand: sesión + keyring de permisos
+    src/router.tsx          # createBrowserRouter con future v7_relativeSplatPath
+    e2e/                    # Playwright
+supabase/migrations/        # 20 migraciones SQL — el esquema vive aquí
+PRODUCT_SPEC.md             # fuente de verdad del alcance y estado de requisitos
+CLAUDE.md                   # guía de trabajo para agentes y personas
 ```
 
-## Privacidad y datos
+---
 
-- El código de este repositorio es propio. No incluye código propietario de forjabots ni de ningún otro producto comercial.
-- Las credenciales de Twilio se guardan en la tabla `profiles` (en MVP sin cifrar; cifrado vía `pgsodium` queda para una fase posterior).
-- Los medios compartidos por WhatsApp se almacenan en el bucket privado `whatsapp-media` de Supabase Storage y se sirven mediante URLs firmadas de 1 h.
+## Consideraciones operativas
 
-## Licencia
-
-Privado.
+- **`scripts/db.ts` y los smoke tests usan `DATABASE_URL` (superuser) y la service-role key.** Nunca los apuntes a una base compartida o de producción.
+- **El service-role key es un superusuario de la base.** Trátalo como tal. Nunca debe llegar al navegador — por eso vive solo en `apps/api/.env` y `SUPABASE_SECRET_KEY` no tiene prefijo público.
+- **`next dev` reinyecta `apps/api/AGENTS.md`** en cada arranque; no lo borres a mano.
+- **Instancias de dev zombis.** `pnpm -r --parallel` no mata una instancia anterior. Antes de arrancar: `lsof -nP -iTCP:3000 -sTCP:LISTEN`. Matar solo la API no alcanza — la mitad web revienta igual con `EADDRINUSE`.
+- **La ruta de un ticket nuevo sin `theme_id` no aparece en el tablero.** El pipeline filtra `theme_id != null`. Asignar un proyecto no es una feature separada: es lo que hace un ticket visible.
+- **El trigger `handle_new_user` es dueño de la creación de `profiles`.** Cualquier código que cree un usuario actualiza esa fila.
+- **Nomenclatura del producto:** "Proyectos" (antes "Temas") y "Clientes" (antes "Contactos"). Los clientes no inician sesión; los usuarios sí. No son sinónimos.
