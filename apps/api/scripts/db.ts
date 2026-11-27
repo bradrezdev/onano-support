@@ -39,13 +39,32 @@ function requireEnv(name: string): string {
 
 async function withClient<T>(fn: (c: Client) => Promise<T>): Promise<T> {
   const url = requireEnv('DATABASE_URL')
-  const c = new Client({ connectionString: url, ssl: { rejectUnauthorized: false } })
+  const c = new Client({ connectionString: url, ssl: sslFor(url) })
   await c.connect()
   try {
     return await fn(c)
   } finally {
     await c.end()
   }
+}
+
+/**
+ * TLS: el Postgres alojado de Supabase exige SSL; el Postgres local de la
+ * instancia efímera NO lo soporta y rechaza la conexión si se le pide
+ * ("The server does not support SSL connections"). El destino decide.
+ */
+function sslFor(url: string): false | { rejectUnauthorized: boolean } {
+  const host = (() => {
+    try {
+      return new URL(url).hostname
+    } catch {
+      return ''
+    }
+  })()
+  if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '0.0.0.0') {
+    return false
+  }
+  return { rejectUnauthorized: false }
 }
 
 function repoRoot(): string {
