@@ -261,9 +261,11 @@ WEBHOOK_BASE_URL=https://<tu-dominio>
 
 ```bash
 VITE_API_BASE_URL=http://localhost:3000
-NEXT_PUBLIC_SUPABASE_URL=https://<proyecto>.supabase.co
-NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=<publishable key>
+VITE_SUPABASE_URL=https://<proyecto>.supabase.co
+VITE_SUPABASE_ANON_KEY=<publishable key>
 ```
+
+El prefijo es `VITE_` porque la web es una SPA de Vite: solo se expone al navegador lo que lleva ese prefijo. Los `NEXT_PUBLIC_*` son del backend (Next) y van en `apps/api/.env`.
 
 `.env` y `.env.local` están en `.gitignore` a nivel de repo. Nunca los commitees.
 
@@ -273,7 +275,7 @@ NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=<publishable key>
 pnpm --filter @crm/api db:migrate
 ```
 
-Aplica las 20 migraciones en orden. Es idempotente: volver a correrlo no rompe nada.
+Aplica las 22 migraciones en orden. Es idempotente: volver a correrlo no rompe nada. Si una migración revierte, el ejecutor **detiene la secuencia**, la deja PENDIENTE (no la registra) y sale con código distinto de 0.
 
 ### 4. Primer usuario
 
@@ -345,6 +347,29 @@ Los E2E protegidos hacen **skip silencioso** si faltan `E2E_EMAIL` y `E2E_PASSWO
 E2E_EMAIL=... E2E_PASSWORD=... pnpm --filter @crm/web test:e2e
 ```
 
+### Entorno de desarrollo
+
+El entorno de desarrollo es un **stack local de Supabase** (Supabase CLI + Docker), persistente y aislado del CI y del proyecto alojado anterior:
+
+```bash
+cd ~/supabase-dev/onano-support-dev && supabase start   # levanta el stack
+bash scripts/dev/local-env.sh                           # escribe apps/*/.env con sus claves
+pnpm --filter @crm/api db:migrate                       # esquema del repo, en orden
+pnpm --filter @crm/api exec tsx scripts/seed-synthetic.ts   # usuarios y datos sintéticos
+```
+
+El proyecto anterior queda en **modo consulta** (`apps/*/.env.legacy`): su esquema fue restaurado por la plataforma y conserva 2 cuentas, 3 clientes y 3 tickets, sin conversaciones, mensajes ni adjuntos. `bash scripts/dev/export-legacy-copy.sh` deja una **copia privada** de lo recuperable.
+
+El **esquema vive fuera de la base**: `supabase/migrations/*.sql` es la fuente de verdad; `public.schema_migrations` es solo contabilidad de lo ya aplicado.
+
+Antes de habilitar datos reales, el validador da el veredicto:
+
+```bash
+pnpm --filter @crm/api exec tsx scripts/validate-access-controls.ts
+```
+
+Mientras el veredicto diga que el entorno no puede recibir datos reales, **el entorno se mantiene sintético**.
+
 ### Base de datos
 
 ```bash
@@ -413,7 +438,7 @@ apps/
     src/stores/auth.ts      # Zustand: sesión + keyring de permisos
     src/router.tsx          # createBrowserRouter con future v7_relativeSplatPath
     e2e/                    # Playwright
-supabase/migrations/        # 20 migraciones SQL — el esquema vive aquí
+supabase/migrations/        # 22 migraciones SQL — el esquema vive aquí (fuera de la base)
 PRODUCT_SPEC.md             # fuente de verdad del alcance y estado de requisitos
 CLAUDE.md                   # guía de trabajo para agentes y personas
 ```

@@ -42,12 +42,29 @@ pnpm --filter @crm/web test:e2e                          # Playwright
   pnpm --filter @crm/api db:query <table>      # select * limit 50
   pnpm --filter @crm/api db:tables
   ```
+  The runner stops at the **first** failed migration: the file stays PENDING (not recorded) and the migrations after it are not applied.
+- **Antes de habilitar datos reales** — el veredicto lo da el validador, no la intuición:
+  ```bash
+  pnpm --filter @crm/api exec tsx scripts/validate-access-controls.ts
+  ```
+  Checks three controls (simultaneous take of the same chat, an unrelated agent's access to history and attachments, and whether a transfer is recorded with who and why) and ends with a verdict. **While the verdict says the environment cannot take real data, it stays synthetic.** Last run: 3 OK, 3 pending (an unrelated agent can post into a chat that is not theirs; attachments are not filtered; a transfer is not recorded).
+- **Respaldo y restauración** — `bash scripts/dev/backup-and-verify-restore.sh` dumps the `public` schema outside the database and restores it **into another instance** to prove the dump is usable.
 - **Smoke tests against the real DB** (from `apps/api`): `pnpm tsx scripts/smoke-batch.ts` (services; restores what it modifies), `pnpm tsx scripts/smoke-http.ts` (route handlers on a real minted admin JWT), `pnpm tsx scripts/make-e2e-admin.ts` (temp admin, prints its id — delete after). They create real data. Unit tests mock Supabase and cannot see triggers/constraints; smoke tests caught production-breaking bugs the unit suite missed.
 - **Stale dev servers**: `pnpm -r --parallel` does not kill previous instances → check `lsof -nP -iTCP:3000 -sTCP:LISTEN` before `pnpm dev` (web also dies with EADDRINUSE).
 - `pnpm add` from non-TTY/agent shells needs a `CI=true` prefix (`ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY`). Keep vitest on 2.x (3.x breaks against web's Vite 8 / TS 6 combo).
 
 ## Environment
 
+- **Entorno de desarrollo = stack LOCAL de Supabase** (Supabase CLI + Docker), persistente (volumen) y aislado tanto del CI como del proyecto alojado anterior. Configuración en `supabase/ci/config.toml`; el stack vive en `~/supabase-dev/onano-support-dev`.
+  ```bash
+  cd ~/supabase-dev/onano-support-dev && supabase start   # levanta el stack
+  bash scripts/dev/local-env.sh                           # escribe apps/*/.env con sus claves
+  pnpm --filter @crm/api db:migrate                       # esquema del repo (22 migraciones)
+  pnpm --filter @crm/api exec tsx scripts/seed-synthetic.ts   # usuarios y datos sintéticos
+  ```
+  En esta máquina el runtime es **colima** (`colima start --cpu 2 --memory 4 --disk 30`); Docker no viene instalado.
+- **El proyecto alojado anterior queda en modo CONSULTA**: sus credenciales están en `apps/api/.env.legacy` y `apps/web/.env.legacy`. No se le escribe nunca. Su esquema fue **restaurado por la plataforma** (PITR a 2026-10-26) y conserva 2 cuentas, 3 clientes y 3 tickets; no hay conversaciones, mensajes ni adjuntos. Copia privada del historial recuperable: `bash scripts/dev/export-legacy-copy.sh`.
+- **El esquema que protege a la base vive FUERA de la base**: `supabase/migrations/*.sql` en el repo. `public.schema_migrations` es solo contabilidad de lo ya aplicado; si el ledger y el repo discrepan, el repo manda.
 - `apps/api/.env` (gitignored): `SUPABASE_URL`, `SUPABASE_SECRET_KEY` (service role = DB superuser; never in the browser), `DATABASE_URL` (scripts only), `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` (SSR cookie client), `TWILIO_AUTH_TOKEN`, `CORS_ORIGINS` (comma list for prod; dev allows any localhost origin).
 - Env lives in `apps/api/.env`: Next.js reads `.env` and `.env.local`, but the **scripts** use `dotenv/config`, which only reads `.env` — the error message in `src/lib/supabase/admin.ts` pointing at `.env.local` is misleading. Run script commands via `pnpm --filter` (or `cd apps/api`) so cwd is `apps/api`.
 - `apps/web/.env`: `VITE_API_BASE_URL` (defaults to `http://localhost:3000`), `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`.

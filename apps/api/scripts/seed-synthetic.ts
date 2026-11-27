@@ -17,6 +17,7 @@ import { createSupabaseAdminClient } from '../src/lib/supabase/admin'
 const PASSWORD = 'E2E-sintetico-9931'
 const ADMIN_EMAIL = 'e2e.admin@example.test'
 const AGENT_EMAIL = 'e2e.agent@example.test'
+const AGENT2_EMAIL = 'e2e.agent2@example.test'
 
 /** Crea la cuenta y su perfil, o reutiliza la que ya existe. */
 async function ensureUser(
@@ -70,6 +71,9 @@ async function main() {
 
   const adminId = await ensureUser(ADMIN_EMAIL, 'E2E Administrador', 'admin')
   const agentId = await ensureUser(AGENT_EMAIL, 'E2E Agente', 'soporte')
+  // Un segundo agente: hace falta para probar la toma simultánea del mismo
+  // chat y el aislamiento entre agentes.
+  const agent2Id = await ensureUser(AGENT2_EMAIL, 'E2E Agente Dos', 'soporte')
 
   // Un rol PERSONALIZADO (no del sistema). La página de colores de rol dice
   // explícitamente que un rol propio solo alcanza `roles.color`, y esa
@@ -248,6 +252,7 @@ async function main() {
     E2E_EMAIL: ADMIN_EMAIL,
     E2E_ADMIN_EMAIL: ADMIN_EMAIL,
     E2E_AGENT_EMAIL: AGENT_EMAIL,
+    E2E_AGENT2_EMAIL: AGENT2_EMAIL,
     E2E_PASSWORD: PASSWORD,
     E2E_TICKET_ID: ticketId,
   }

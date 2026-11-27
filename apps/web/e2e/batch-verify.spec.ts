@@ -195,8 +195,18 @@ test.describe('lote de fixes', () => {
     await page.waitForURL('**/profile')
     await expect(page.getByRole('heading', { name: /mi perfil/i })).toBeVisible()
 
+    // Wait for the profile to land before typing: /api/me is async, and the
+    // form seeds its fields when it answers. Typing before that point is a
+    // race (the app now keeps what was typed, but the test should not depend
+    // on that). The email field only gets a value once the profile arrived.
+    await expect(page.getByLabel(/^email$/i)).toHaveValue(/@/)
+
+    // Unique per run: the assertion has to mean "this run saved this name",
+    // not "the database happened to contain it".
+    const nombre = `Nombre E2E ${Date.now()}`
+
     const name = page.getByLabel(/^nombre$/i)
-    await name.fill('Nombre E2E')
+    await name.fill(nombre)
     await page.getByLabel(/teléfono/i).fill('+52 555 999 0000')
     await page.getByRole('button', { name: /^guardar$/i }).click()
     await expect(page.getByText(/perfil guardado/i)).toBeVisible()
@@ -204,7 +214,7 @@ test.describe('lote de fixes', () => {
     // The topbar must reflect it without a reload.
     await page.goto('/')
     await expect(page.getByRole('button', { name: /abrir mi perfil/i })).toContainText(
-      'Nombre E2E',
+      nombre,
     )
   })
 })

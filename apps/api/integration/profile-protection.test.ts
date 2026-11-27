@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll } from 'vitest'
+import 'dotenv/config'
 import { createClient } from '@supabase/supabase-js'
 
 /**
@@ -180,6 +181,19 @@ describe.skipIf(!enabled)('E1 · quién puede cambiar cada campo protegido', () 
     const { data, error } = await browser.from('roles').select('key').limit(5)
     expect(error).not.toBeNull()
     expect(data ?? []).toEqual([])
+  })
+
+  it('ni anon ni un autenticado pueden resolver los permisos de otro perfil', async () => {
+    // `resolve_permissions` es SECURITY DEFINER: sin el permiso de PUBLIC
+    // (que nace por defecto en Postgres) cualquiera podía pedir el keyring de
+    // CUALQUIER perfil, incluso sin sesión.
+    const anon = createClient(SB_URL!, PUBLISHABLE!, { auth: { persistSession: false } })
+    const asAnon = await anon.rpc('resolve_permissions', { p_profile_id: agentId })
+    expect(asAnon.error).not.toBeNull()
+
+    const browser = createClient(SB_URL!, PUBLISHABLE!, { auth: { persistSession: false } })
+    const asAgent = await browser.rpc('resolve_permissions', { p_profile_id: agentId })
+    expect(asAgent.error).not.toBeNull()
   })
 
   it('el rol del agente vuelve a soporte (limpieza del caso)', async () => {

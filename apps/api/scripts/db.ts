@@ -133,7 +133,11 @@ async function cmdMigrate(): Promise<void> {
         console.error(`  ${f} queda PENDIENTE: no se registró en schema_migrations.`)
         pending.push(f)
         process.exitCode = 1
-        continue
+        // La secuencia se detiene aquí. Una migración que revierte deja el
+        // esquema a medio camino; aplicar las siguientes encima solo puede
+        // empeorar el daño, y el orden del archivo es parte del contrato.
+        console.error('  La secuencia se detiene: las migraciones siguientes NO se aplican.')
+        break
       }
     }
   })
@@ -142,6 +146,7 @@ async function cmdMigrate(): Promise<void> {
     for (const f of pending) console.log(`  - ${f}`)
     console.log('Resuélvelas (objeto duplicado o conflicto) y vuelve a correr db:migrate:')
     console.log('no se registran como aplicadas mientras la transacción revierta.')
+    console.log('Las migraciones que vienen después de la primera fallida tampoco se aplicaron.')
   }
   console.log('\nDone.')
 }
