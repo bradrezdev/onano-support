@@ -233,6 +233,17 @@ jobs:
             exit 1
           fi
 
+      # S11/S12: who may change each protected field. Real DB, real tokens.
+      # Runs BEFORE Playwright: it is faster and pinpoints a failure exactly.
+      - name: E1 · suite de protección de perfiles (base real)
+        run: |
+          set +e
+          pnpm --filter @crm/api test:integration 2>&1 | tee /tmp/e1-integration.log
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "exit_e1_integration=${code}" >> "$GITHUB_ENV"
+          exit "${code}"
+
       - name: E2E (Playwright, autenticado)
         env:
           BASE_URL: http://localhost:5173
@@ -253,16 +264,6 @@ jobs:
       # S8: zero authenticated tests means E1 is PENDING, not green.
       - name: Count authenticated tests
         run: node scripts/ci/count-authenticated-tests.mjs /tmp/e2e-results.json /tmp/e2e-auth-marker.txt
-
-      # S11/S12: who may change each protected field. Real DB, real tokens.
-      - name: E1 · suite de protección de perfiles (base real)
-        run: |
-          set +e
-          pnpm --filter @crm/api test:integration 2>&1 | tee /tmp/e1-integration.log
-          code=${PIPESTATUS[0]}
-          set -e
-          echo "exit_e1_integration=${code}" >> "$GITHUB_ENV"
-          exit "${code}"
 
       - name: E2E summary
         if: always()

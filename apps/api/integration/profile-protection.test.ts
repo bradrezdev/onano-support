@@ -93,6 +93,7 @@ describe.skipIf(!enabled)('E1 · quién puede cambiar cada campo protegido', () 
     })
     expect(res.status).toBe(200)
 
+    // La fila, leída con service_role: la escritura ocurrió de verdad.
     const { data, error } = await service
       .from('profiles')
       .select('display_name')
@@ -100,6 +101,11 @@ describe.skipIf(!enabled)('E1 · quién puede cambiar cada campo protegido', () 
       .single<{ display_name: string }>()
     expect(error).toBeNull()
     expect(data?.display_name).toBe(nombre)
+
+    // Y la API lo refleja: si /api/me devolviera el valor viejo, la escritura
+    // estaría en la fila pero la aplicación seguiría viendo lo anterior.
+    const me = await api(agentToken, '/api/me')
+    expect(me.body?.data?.display_name).toBe(nombre)
   })
 
   it('el agente no cambia campos administrativos por la API', async () => {

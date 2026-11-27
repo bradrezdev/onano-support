@@ -71,6 +71,26 @@ async function main() {
   const adminId = await ensureUser(ADMIN_EMAIL, 'E2E Administrador', 'admin')
   const agentId = await ensureUser(AGENT_EMAIL, 'E2E Agente', 'soporte')
 
+  // Un rol PERSONALIZADO (no del sistema). La página de colores de rol dice
+  // explícitamente que un rol propio solo alcanza `roles.color`, y esa
+  // diferencia solo existe si hay un rol que no sea del sistema.
+  const { data: existingCustom } = await admin
+    .from('roles')
+    .select('id')
+    .eq('key', 'e2e_auditor')
+    .maybeSingle<{ id: string }>()
+  if (!existingCustom) {
+    const { error } = await admin.from('roles').insert({
+      key: 'e2e_auditor',
+      name: 'e2e.Auditor',
+      description: 'Rol sintético para verificar la página de colores',
+      color: '#64748b',
+      is_system: false,
+      created_by: adminId,
+    })
+    if (error) throw new Error(`roles: ${error.message}`)
+  }
+
   // Categoría
   const { data: existingCat } = await admin
     .from('categories')
