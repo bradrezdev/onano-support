@@ -36,9 +36,7 @@ function walk(suites) {
       const file = spec.file ?? spec.fileName ?? suite.file ?? 'desconocido'
       for (const test of spec.tests ?? []) {
         total += 1
-        const results = test.results ?? []
-        const last = results[results.length - 1]
-        const status = test.status ?? last?.status ?? 'unknown'
+        const status = outcomeOf(test)
         if (status === 'passed') passed += 1
         else if (status === 'failed') failed += 1
         else if (status === 'skipped') skipped += 1
@@ -52,6 +50,22 @@ function walk(suites) {
     }
     walk(suite.suites)
   }
+}
+
+/**
+ * El reporter JSON de Playwright pone el resultado real en
+ * `results[last].status`; `test.status` vale 'expected'/'unexpected' (la
+ * expectativa) y 'skipped' cuando no corrió. Sin esta traducción, el conteo
+ * reportaba cero pasadas con dieciocho pruebas ejecutadas.
+ */
+function outcomeOf(test) {
+  const results = test.results ?? []
+  const last = results[results.length - 1]
+  const raw = last?.status ?? test.status ?? 'unknown'
+  if (raw === 'passed' || raw === 'expected' || raw === 'flaky') return 'passed'
+  if (raw === 'failed' || raw === 'unexpected') return 'failed'
+  if (raw === 'skipped') return 'skipped'
+  return raw
 }
 
 walk(report.suites)
