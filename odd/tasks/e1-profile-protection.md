@@ -33,7 +33,13 @@ Test runner: `pnpm test` (vitest, api+web) · `pnpm --filter @crm/web test:e2e` 
 | T5 | S4, S5, S6 | inline | hecho | E1 |
 | T6 | S2, S3, S7, S8 | inline | hecho | E1 |
 | T7 | S11, S12 | inline | hecho | E1 |
-| T8 | S14 | inline | en curso | E1 |
+| T8 | S14 | inline | hecho | E1 |
+
+**Pendiente que NO entra en E1 (queda registrado, no resuelto):**
+- La base compartida **no** tiene el esquema: `public` está vacío (solo `auth`, `extensions`, `vault`). La migración E1 **no** se aplicó ahí (escritura reservada para aprobación aparte). Al restaurarla hay que aplicar `db:migrate` antes de abrir la app: mientras tanto, el esquema restaurado traería la autoedición abierta otra vez.
+- Las **políticas del bucket de Storage** (`whatsapp-media`) siguen fuera de este migration: `storage.objects` vive en otro esquema y los privilegios de `public` no lo tocan. Hoy cualquier autenticado puede borrar adjuntos. Es el P1 de almacenamiento, para E4/E5.
+- **Rotación del token de Twilio**: la contención (columnas eliminadas) está en el migration, pero la migración no se aplicó en la base real. Mientras tanto, el token sigue vivo: si existió valor en `profiles.twilio_auth_token`, hay indicios razonables de exposición (la política de lectura era `using (true)`) y la rotación es acción del operador.
+- La **clave `service_role`** vive solo en `apps/api/.env` (fuera del repo); no hay evidencia de exposición en el repositorio ni en los logs de CI. Sin base para rotarla.
 
 ## Log
 
@@ -48,3 +54,7 @@ Test runner: `pnpm test` (vitest, api+web) · `pnpm --filter @crm/web test:e2e` 
 - **L9** (2026-11-27) La suite protegida escribe un **testigo** (`E2E_AUTH_MARKER`) solo después de un inicio de sesión real. `scripts/ci/count-authenticated-tests.mjs` falla el job si el testigo no existe: cero pruebas autenticadas ⇒ E1 **PENDIENTE**, no verde.
 - **L10** (2026-11-27) E1 entra como **un solo commit**: el código, la puerta de CI y la documentación tienen que moverse juntos (el review GGA rechaza documentación desalineada con el código). Si hace falta foco de revisión, se divide antes del PR, no después.
 - **L11** (2026-11-27) Verificación local antes de publicar: typecheck ✓, 345 unit tests de API + 34 de web ✓, lint 0 errores (24 warnings) ✓, build ✓, Playwright local 10 pasan / 8 omitidos ✓.
+- **L12** (2026-11-27) Cuatro corridas reales de CI, cada una con un defecto distinto (todos corregidos): `file_size_limit` con sufijo inválido (`Mi` → `MiB`); el Postgres local no acepta SSL y el script lo exigía; el detector de «migración registrada» daba falso positivo porque el nombre del archivo aparece en la línea del comando impreso; el conteo de Playwright leía la expectativa (`expected`) y no el resultado real (`results[last].status`).
+- **L13** (2026-11-27) La suite E1 corre **antes** que Playwright: es más rápida y señala el fallo exacto. Playwright va después porque necesita el servidor web.
+- **L14** (2026-11-27) Evidencia final: corrida verde (ambos jobs) y corrida con **fallo controlado inyectado** (`controlled_failure=unit`) que pone rojo el paso de pruebas unitarias y deja el resto del job sin correr. Conteo de la corrida verde: Playwright 18/18 (8 autenticadas + 10 smoke, 0 omitidas, 8 autenticaciones reales), suite E1 6/6, unitarias 29 archivos de API + 3 de web.
+- **L15** (2026-11-27) Hallazgo de la semilla: el test de colores de rol exige la nota «solo en roles.color», que solo aparece para un rol **no del sistema**; la base efímera no tenía ninguno y la prueba fallaba por eso, no por un defecto del código. La semilla crea ahora un rol personalizado sintético.
