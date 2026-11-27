@@ -36,6 +36,7 @@ class QueryMock {
 
 const mockAdmin: any = {
   from: vi.fn((): QueryMock => new QueryMock()),
+  rpc: vi.fn(),
 }
 
 vi.mock('@/lib/supabase/admin', () => ({
@@ -46,6 +47,8 @@ const roles = await import('./roles')
 
 beforeEach(() => {
   mockAdmin.from.mockReset()
+  mockAdmin.rpc.mockReset()
+  mockAdmin.rpc.mockResolvedValue({ data: null, error: null })
 })
 
 function setNextFrom(payload: Response): QueryMock {
@@ -166,7 +169,6 @@ describe('createRole', () => {
   it('creates a role with no permissions at all', async () => {
     setNextFrom({ data: null, error: null }) // duplicate check -> none
     const insertQ = setNextFrom({ data: makeRole(), error: null })
-    const delQ = setNextFrom({ data: null, error: null }) // replacePermissions clears
 
     const out = await roles.createRole({ ...valid, permissions: [] }, 'u-1')
 
@@ -175,22 +177,29 @@ describe('createRole', () => {
       is_system: false,
       created_by: 'u-1',
     })
-    // No rows inserted when the keyring is empty.
-    expect(delQ.ops.some((o) => o.op === 'delete')).toBe(true)
+    // The keyring is replaced through the transactional function, with an
+    // empty list: the role keeps no permissions and the swap is audited.
+    expect(mockAdmin.rpc).toHaveBeenCalledWith('admin_replace_role_permissions', {
+      p_role_id: 'role-1',
+      p_permission_keys: [],
+      p_actor: 'u-1',
+    })
     expect(out.permissions).toEqual([])
   })
 
   it('writes the keyring after creating the role', async () => {
     setNextFrom({ data: null, error: null })
     setNextFrom({ data: makeRole(), error: null })
-    setNextFrom({ data: null, error: null }) // delete
-    const grantQ = setNextFrom({ data: null, error: null }) // insert
 
     const out = await roles.createRole(valid, 'u-1')
 
-    expect(grantQ.ops.find((o) => o.op === 'insert')?.args[0]).toEqual([
-      { role_id: 'role-1', permission_key: 'ticket.reply', granted_by: 'u-1' },
-    ])
+    // One call replaces the whole keyring and leaves the audit entry in the
+    // same transaction.
+    expect(mockAdmin.rpc).toHaveBeenCalledWith('admin_replace_role_permissions', {
+      p_role_id: 'role-1',
+      p_permission_keys: ['ticket.reply'],
+      p_actor: 'u-1',
+    })
     expect(out.permissions).toEqual(['ticket.reply'])
   })
 
@@ -272,13 +281,24 @@ describe('updateRole', () => {
   it('replaces the keyring when permissions are provided', async () => {
     // Patch has no name/color, so no roles.update call: only the keyring swap.
     setNextFrom({ data: makeRole(), error: null }) // findRoleOrThrow (before)
-    const delQ = setNextFrom({ data: null, error: null })
-    const grantQ = setNextFrom({ data: null, error: null })
     setNextFrom({ data: makeRole(), error: null }) // findRoleOrThrow (after)
 
     await roles.updateRole('role-1', { permissions: ['ticket.reply', 'ticket.close'] }, 'u-1')
 
-    expect(delQ.ops.some((o) => o.op === 'delete')).toBe(true)
-    expect(grantQ.ops.find((o) => o.op === 'insert')?.args[0]).toHaveLength(2)
+    // The swap is one transactional call, not a delete followed by an insert.
+    expect(mockAdmin.rpc).toHaveBeenCalledWith('admin_replace_role_permissions', {
+      p_role_id: 'role-1',
+      p_permission_keys: ['ticket.reply', 'ticket.close'],
+      p_actor: 'u-1',
+    })
+  })
+
+  it('propagates the error when the transactional swap fails', async () => {
+    setNextFrom({ data: makeRole(), error: null }) // findRoleOrThrow (before)
+    mockAdmin.rpc.mockResolvedValue({ data: null, error: { message: 'db down' } })
+
+    await expect(
+      roles.updateRole('role-1', { permissions: ['ticket.reply'] }, 'u-1'),
+    ).rejects.toBeDefined()
   })
 })

@@ -1,0 +1,49 @@
+# Configuración de la instancia EFÍMERA de Supabase que usa el job de E2E.
+#
+# Este archivo NO es la configuración del proyecto real: es la del stack
+# efímero que CI levanta en cada corrida. Vive en `supabase/ci/` y CI lo copia
+# a un directorio temporal antes de `supabase start`, para que:
+#
+#   · el stack se levante SIN el `supabase/migrations` del repo — así la única
+#     puerta de esquema es el ejecutor del repo (`db:migrate`), y su ledger es
+#     lo que CI valida;
+#   · nadie pueda confundir este arranque con el de una base real.
+#
+# Ver scripts/ci/ y .github/workflows/ci.yml.
+
+project_id = "onano-support-ci"
+
+[api]
+enabled = true
+port = 54321
+schemas = ["public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[db]
+port = 54322
+shadow_port = 54320
+major_version = 15
+
+[studio]
+enabled = false
+port = 54323
+
+[storage]
+enabled = true
+file_size_limit = "50Mi"
+
+[auth]
+enabled = true
+site_url = "http://localhost:5173"
+additional_redirect_urls = ["http://localhost:5173", "http://127.0.0.1:5173"]
+jwt_expiry = 3600
+enable_signup = true
+
+[auth.email]
+enable_signup = true
+double_confirm_changes = true
+enable_confirmations = false
+
+[analytics]
+enabled = false

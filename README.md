@@ -83,6 +83,19 @@ Postgres de Supabase, 24 tablas, esquema 100% en SQL (no Prisma ni Drizzle). La 
 | `permissions` | Catálogo de 34 llaves de permiso, con `label` y `group_name` |
 | `role_permissions` | Keyring: qué rol tiene qué llave. many-to-many con `granted_by` |
 | `role_color_settings` | Color y desvanecido por rol, para las burbujas de los mensajes |
+| `admin_audit_log` | Bitácora **append-only** de acciones administrativas (rol, suspensión, permisos). El cambio y su registro se escriben en la misma transacción |
+
+### Quién puede cambiar qué (E1)
+
+`anon` y `authenticated` **no tienen ningún privilegio sobre `public`**: la app habla con la base solo con `service_role`, y el SPA usa la clave publicable únicamente para Auth. Por eso el acceso directo a los datos por REST no existe, y la autoedición de perfil tampoco.
+
+| Actor | Campos que puede cambiar | Vía |
+|---|---|---|
+| Cualquiera (su propio perfil) | `display_name`, `phone` | `PATCH /api/me` — el cuerpo es el allowlist completo (`z.strictObject`); cualquier otra clave se rechaza, no se ignora |
+| Admin con `admin.assignRole` | `role_key`, `suspension`, `display_name` de otro usuario | `PATCH /api/users/[id]` → `admin_update_profile` (transaccional + auditado) |
+| Admin con `admin.manageRoles` | Permisos de un rol | `PATCH /api/roles/[id]` → `admin_replace_role_permissions` (transaccional + auditado) |
+
+Las columnas de credenciales de Twilio se eliminaron de `profiles`: ningún código las leía y la política de lectura las exponía a cualquier usuario autenticado.
 
 ### Dominio: clientes y conversaciones
 
@@ -300,14 +313,21 @@ CI=true pnpm install --frozen-lockfile   # lockfile congelado
 pnpm --filter @crm/api typegen            # tipos de ruta: DEBEN existir antes de tsc
 pnpm typecheck
 pnpm test
-pnpm --filter @crm/web lint               # informativo: hay deuda de warnings conocida
+pnpm --filter @crm/web lint               # oxlint: falla por ERRORES (hoy 0 errores, 24 warnings)
 pnpm build
-pnpm e2e                                  # requiere E2E_EMAIL/E2E_PASSWORD y una base aislada
+```
+
+El job de E2E de CI levanta una **instancia efímera de Supabase** (Docker del runner), aplica las migraciones con el ejecutor del repo, siembra usuarios y datos **sintéticos** y corre las pruebas autenticadas de verdad:
+
+```bash
+pnpm --filter @crm/api test:integration   # E1: quién puede cambiar cada campo protegido
 ```
 
 `pnpm --filter @crm/api typecheck` ya ejecuta `next typegen` antes de `tsc`: `apps/api` usa el global `LayoutProps` que Next genera, y sin ese paso un checkout limpio falla con `TS2304: Cannot find name 'LayoutProps'`.
 
 Node 22+ (`.nvmrc`), pnpm 11.22.0 (la versión sale de `packageManager`; no la fijes también en la acción de CI o la acción aborta con «Multiple versions of pnpm specified»).
+
+El workflow acepta una entrada `controlled_failure` (`unit|lint|build|e2e`) que inyecta un fallo deliberado: sirve para **demostrar que la puerta correspondiente se pone roja**.
 
 ### Tests
 
@@ -315,10 +335,11 @@ Node 22+ (`.nvmrc`), pnpm 11.22.0 (la versión sale de `packageManager`; no la f
 pnpm --filter @crm/api test src/services/users.test.ts   # un archivo
 pnpm --filter @crm/api test -t "createUser"               # un caso
 pnpm --filter @crm/web test:e2e                           # Playwright
+pnpm --filter @crm/api test:integration                   # E1 contra una base real
 pnpm --filter @crm/web lint                               # oxlint
 ```
 
-Los E2E protegidos hacen **skip silencioso** si faltan `E2E_EMAIL` y `E2E_PASSWORD`. Un "todo verde" puede ser cero tests ejecutados:
+Los E2E protegidos hacen **skip silencioso** si faltan `E2E_EMAIL` y `E2E_PASSWORD`. Un "todo verde" puede ser cero tests ejecutados, así que en CI el conteo es una puerta: si no corrieron pruebas **autenticadas**, el job falla y E1 queda **PENDIENTE**:
 
 ```bash
 E2E_EMAIL=... E2E_PASSWORD=... pnpm --filter @crm/web test:e2e
@@ -332,6 +353,8 @@ pnpm --filter @crm/api db:exec "<SQL>"        # una sentencia o ./ruta.sql
 pnpm --filter @crm/api db:query <tabla>
 pnpm --filter @crm/api db:tables
 ```
+
+El ejecutor de migraciones es honesto: una migración que revierte (por ejemplo, por un objeto duplicado) **queda PENDIENTE**, no se registra en `schema_migrations` y el proceso comunica el error con código de salida distinto de 0. El texto «already exists» no acredita que la migración se haya completado. `scripts/ci/prove-pending-migration.sh` lo demuestra en cada corrida de CI.
 
 ### Convenciones
 

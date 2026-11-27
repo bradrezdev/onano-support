@@ -67,6 +67,9 @@ async function cmdMigrate(): Promise<void> {
     return
   }
   console.log(`Applying ${files.length} migrations from ${dir}\n`)
+  // Files that could not be completed. A migration that hits a duplicate
+  // object rolls back and stays here: it is NOT recorded as applied.
+  const pending: string[] = []
   await withClient(async (c) => {
     // Track applied migrations in a small table so re-runs are safe and
     // idempotent regardless of which IF NOT EXISTS guards each file ships.
@@ -101,25 +104,26 @@ async function cmdMigrate(): Promise<void> {
       } catch (err) {
         await c.query('rollback').catch(() => undefined)
         const msg = (err as Error).message
-        // Tolerate idempotent re-runs even without schema_migrations seed:
-        // skip if it's an "already exists" error and still record it.
-        if (/already exists|duplicate/i.test(msg)) {
-          await c
-            .query(
-              `insert into public.schema_migrations (filename) values ($1) on conflict do nothing`,
-              [f],
-            )
-            .catch(() => undefined)
-          console.log('skip (already applied)')
-          continue
-        }
+        // Un "already exists" NO acredita que la migración se haya completado:
+        // la transacción ya revirtió, así que el archivo queda PENDIENTE (no se
+        // registra en schema_migrations) y el error se comunica. Registrarlo
+        // como aplicado dejaría esquema y ledger discrepados, y el siguiente
+        // `db:migrate` lo saltaría como si hubiera funcionado.
         console.log('FAIL')
         console.error(`  ${msg}`)
+        console.error(`  ${f} queda PENDIENTE: no se registró en schema_migrations.`)
+        pending.push(f)
         process.exitCode = 1
-        return
+        continue
       }
     }
   })
+  if (pending.length > 0) {
+    console.log(`\n${pending.length} migración(es) pendiente(s):`)
+    for (const f of pending) console.log(`  - ${f}`)
+    console.log('Resuélvelas (objeto duplicado o conflicto) y vuelve a correr db:migrate:')
+    console.log('no se registran como aplicadas mientras la transacción revierta.')
+  }
   console.log('\nDone.')
 }
 

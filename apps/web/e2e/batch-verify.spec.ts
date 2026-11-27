@@ -1,3 +1,4 @@
+import { appendFileSync } from 'node:fs'
 import { test, expect, type Page } from '@playwright/test'
 
 /**
@@ -35,6 +36,17 @@ test.describe('lote de fixes', () => {
   test.beforeEach(async ({ page }) => {
     consoleErrors.length = 0
     await signIn(page, EMAIL!, PASSWORD!)
+    // Testigo: se escribe SOLO después de un inicio de sesión real, para que
+    // CI pueda distinguir "la suite protegida corrió" de "se omitió por falta
+    // de credenciales". Un job verde sin este testigo no probó nada.
+    const marker = process.env.E2E_AUTH_MARKER
+    if (marker) {
+      try {
+        appendFileSync(marker, 'authenticated\n')
+      } catch {
+        // El testigo es una ayuda para el job, no una condición de la prueba.
+      }
+    }
     page.on('console', (m) => {
       if (m.type() === 'error') consoleErrors.push(m.text())
     })

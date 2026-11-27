@@ -41,11 +41,14 @@ pnpm --filter @crm/api test -t "createUser"       # por nombre de test
 pnpm --filter @crm/web test:e2e                   # Playwright
 pnpm --filter @crm/web test:e2e --headed
 
+# E1: quién puede cambiar cada campo protegido (base real, tokens reales)
+pnpm --filter @crm/api test:integration
+
 # Playwright protegido: sin esto los tests con sesión hacen skip en silencio
 E2E_EMAIL=... E2E_PASSWORD=... pnpm --filter @crm/web test:e2e
 ```
 
-**Verificación reproducible (idéntica a CI):** `CI=true pnpm install --frozen-lockfile` → `pnpm --filter @crm/api typegen` → `pnpm typecheck` → `pnpm test` → `pnpm --filter @crm/web lint` → `pnpm build` → `pnpm e2e`.
+**Verificación reproducible (idéntica a CI):** `CI=true pnpm install --frozen-lockfile` → `pnpm --filter @crm/api typegen` → `pnpm typecheck` → `pnpm test` → `pnpm --filter @crm/web lint` → `pnpm build`. El job de E2E de CI va aparte: levanta una **instancia efímera de Supabase**, aplica las migraciones con el ejecutor del repo, siembra datos sintéticos y corre las pruebas autenticadas. Si no corrieron pruebas autenticadas, el job falla y E1 queda PENDIENTE. El workflow acepta `controlled_failure` (`unit|lint|build|e2e`) para demostrar que una puerta se pone roja.
 
 El paso `typegen` no es opcional: `apps/api` usa el global `LayoutProps` que Next genera en `.next/types`, así que sin `next typegen` un checkout limpio falla con `TS2304: Cannot find name 'LayoutProps'`. Node 22+ (`.nvmrc`); pnpm 11.22.0 sale de `packageManager` — si además lo fijás en `pnpm/action-setup`, la acción aborta con «Multiple versions of pnpm specified».
 
@@ -57,6 +60,8 @@ pnpm --filter @crm/api db:exec "<SQL>"        # una sentencia o ./ruta.sql
 pnpm --filter @crm/api db:query <tabla>
 pnpm --filter @crm/api db:tables
 ```
+
+El ejecutor es honesto: una migración que revierte (objeto duplicado, por ejemplo) queda **PENDIENTE**, no se registra en `schema_migrations` y el proceso sale con código ≠ 0. «already exists» no acredita que la migración se haya completado.
 
 **Verificación contra la base real** — estos existe porque los unit tests no pueden ver triggers, columnas inexistentes ni constraints:
 

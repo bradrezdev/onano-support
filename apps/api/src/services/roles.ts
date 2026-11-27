@@ -253,21 +253,14 @@ async function replacePermissions(
     )
   }
 
-  const { error: delErr } = await admin
-    .from('role_permissions')
-    .delete()
-    .eq('role_id', roleId)
-  if (delErr) throw delErr
-
-  if (known.length === 0) return
-
-  const { error } = await admin.from('role_permissions').insert(
-    known.map((key) => ({
-      role_id: roleId,
-      permission_key: key,
-      granted_by: actorId,
-    })),
-  )
+  // The replacement and its audit entry land in the SAME transaction
+  // (`admin_replace_role_permissions`). Delete + insert as two calls could
+  // leave a role with no permissions and no trail of who emptied it.
+  const { error } = await admin.rpc('admin_replace_role_permissions', {
+    p_role_id: roleId,
+    p_permission_keys: known,
+    p_actor: actorId,
+  })
   if (error) throw error
 }
 
