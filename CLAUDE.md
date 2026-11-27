@@ -16,9 +16,9 @@ CRM interno de ONANO Global para gestionar incidencias (pagos, registros, red, e
 
 ## Stack (lo que hay en el árbol, no lo que dice el README)
 
-El `README.md` raíz está **desactualizado**: describe "Fastify backend + Vue 3 frontend". Lo real es:
+El `README.md` raíz refleja el estado real del proyecto. Lo que hay en el árbol:
 
-- **`apps/api/`** — Next.js 16.4.2 (App Router, `:3000`), TS strict, Zod 4, clientes Supabase server + admin. 42 route handlers bajo `src/app/api/`.
+- **`apps/api/`** — Next.js 16.4.6 (App Router, `:3000`), TS strict, Zod 4, clientes Supabase server + admin. 42 route handlers bajo `src/app/api/`.
 - **`apps/web/`** — React 19 + Vite (`:5173`), Tailwind v3, Zustand, React Router v6. Cero acceso a Postgres: todo pasa por la API.
 - **`supabase/migrations/`** — 20 migraciones SQL. **El esquema vive aquí, no en Prisma/Drizzle.**
 - **`apps/api/src/middleware.ts`** — CORS. Sin él el SPA ve "Load failed" en cada `fetch` cross-origin.
@@ -30,21 +30,26 @@ El `README.md` raíz está **desactualizado**: describe "Fastify backend + Vue 3
 pnpm install
 pnpm dev / dev:api / dev:web     # paralelo por defecto
 pnpm build                       # tsc -b + next build + vite build
-pnpm typecheck                   # tsc --noEmit en ambos workspaces
+pnpm typecheck                   # en la API: next typegen + tsc --noEmit; en web: tsc -b --noEmit
 pnpm test                        # vitest run (api + web)
+pnpm lint                        # oxlint (solo web)
+pnpm e2e                         # Playwright
 
 # Un solo archivo / un solo caso
 pnpm --filter @crm/api test src/services/users.test.ts
 pnpm --filter @crm/api test -t "createUser"       # por nombre de test
 pnpm --filter @crm/web test:e2e                   # Playwright
 pnpm --filter @crm/web test:e2e --headed
-pnpm --filter @crm/web lint                       # oxlint (solo web)
 
 # Playwright protegido: sin esto los tests con sesión hacen skip en silencio
 E2E_EMAIL=... E2E_PASSWORD=... pnpm --filter @crm/web test:e2e
 ```
 
-`pnpm lint` **hoy sale con código 1**: oxlint cuenta los warnings como fallo. Son 25 warnings en 17 archivos, 0 errores, y la mayoría son preexistentes (`set-state-in-effect` y `exhaustive-deps` en el mismo patrón de carga de datos de casi todas las páginas). No lo tomes como una regresión tuya sin comparar contra `main` primero.
+**Verificación reproducible (idéntica a CI):** `CI=true pnpm install --frozen-lockfile` → `pnpm --filter @crm/api typegen` → `pnpm typecheck` → `pnpm test` → `pnpm --filter @crm/web lint` → `pnpm build` → `pnpm e2e`.
+
+El paso `typegen` no es opcional: `apps/api` usa el global `LayoutProps` que Next genera en `.next/types`, así que sin `next typegen` un checkout limpio falla con `TS2304: Cannot find name 'LayoutProps'`. Node 22+ (`.nvmrc`); pnpm 11.22.0 sale de `packageManager` — si además lo fijás en `pnpm/action-setup`, la acción aborta con «Multiple versions of pnpm specified».
+
+`pnpm lint` **hoy sale con código 0**: oxlint falla por errores, no por warnings. Quedan **24 warnings y 0 errores**, y la mayoría de los warnings son preexistentes (`set-state-in-effect` y `exhaustive-deps` en el mismo patrón de carga de datos de casi todas las páginas). El único error que había (`react-hooks/rules-of-hooks` sobre el fixture de Playwright, cuyo callback no puede llamarse `use` ni empezar por `use`) ya está corregido.
 
 ```bash
 pnpm --filter @crm/api db:migrate              # aplica migraciones en orden
@@ -109,7 +114,7 @@ Un ticket sin `theme_id` **no aparece en el tablero** — `PipelinePage` filtra 
 - **Identidad de cliente = E.164 normalizado**, en escritura *y* en búsqueda. Dos registros para una persona parten su historial.
 - **`z.strictObject` cuando el allowlist del body ES el punto del endpoint.** Con `z.object`, Zod descarta claves desconocidas: mandar `role` a `PATCH /api/me` devolvía 200 sin escribir nada. Seguro, pero le decía al cliente "guardado" cuando no había guardado.
 - **Tailwind: `brand` + `role.{admin,supervisor,soporte}`.** Los colores de rol se aplican como custom properties en `:root` desde `/api/role-colors`.
-- **`tsconfig.base.json`** activa `strict` + `noUncheckedIndexedAccess` + `noImplicitOverride`. El acceso a índices devuelve `T | undefined`.
+- **La strictness es por app, no heredada**: `tsconfig.base.json` está huérfano (nadie lo extiende). `apps/api/tsconfig.json` corre `strict` plano **sin** `noUncheckedIndexedAccess` — ahí el acceso a índices devuelve `T`, no `T | undefined`; solo `apps/web/tsconfig.app.json` activa `noUncheckedIndexedAccess: true`.
 
 ## Critical caveats
 

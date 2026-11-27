@@ -15,10 +15,15 @@ async function signIn(page: Page, email: string, password: string) {
   await page.waitForURL((url) => !url.pathname.startsWith('/login'), { timeout: 20_000 })
 }
 
-const EMAIL = process.env.E2E_EMAIL!
-const PASSWORD = process.env.E2E_PASSWORD!
+const EMAIL = process.env.E2E_EMAIL
+const PASSWORD = process.env.E2E_PASSWORD
 
 test.describe('lote de fixes', () => {
+  // The suite needs a real account. Without credentials it must SKIP (the
+  // documented contract), not fail: filling `undefined` into the login form
+  // produces 8 red tests that say nothing about the app.
+  test.skip(!EMAIL || !PASSWORD, 'E2E_EMAIL/E2E_PASSWORD not set — skipping protected suite')
+
   // A console error on any of these pages is a real defect: a white screen
   // with a passing locator is still a broken page.
   //
@@ -29,7 +34,7 @@ test.describe('lote de fixes', () => {
   const consoleErrors: string[] = []
   test.beforeEach(async ({ page }) => {
     consoleErrors.length = 0
-    await signIn(page, EMAIL, PASSWORD)
+    await signIn(page, EMAIL!, PASSWORD!)
     page.on('console', (m) => {
       if (m.type() === 'error') consoleErrors.push(m.text())
     })

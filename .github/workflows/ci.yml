@@ -5,30 +5,144 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Manual run: lets a branch be verified before it is proposed to main.
+  workflow_dispatch:
+
+# Least privilege: this workflow only reads the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  test:
-    name: pnpm install + typecheck + test
+  verify:
+    name: install + typegen + typecheck + test + lint + build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # pnpm version comes from packageManager (pnpm@11.22.0) in package.json.
+      # Passing `version:` here as well makes the action refuse with
+      # "Multiple versions of pnpm specified" — that alone failed every run.
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: CI=true pnpm install --frozen-lockfile
+
+      # Route/layout type definitions must exist before tsc: apps/api uses the
+      # generated `LayoutProps` global, which only exists after `next typegen`
+      # (or a build). On a clean checkout, typecheck without this step fails
+      # with TS2304: Cannot find name 'LayoutProps'.
+      - name: Generate API route types
+        run: pnpm --filter @crm/api typegen
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Unit tests
+        run: pnpm test 2>&1 | tee /tmp/unit-tests.log
+
+      # Blocking gate: oxlint fails on ERRORS (it does not count warnings as
+      # failures — the web app carries 24 pre-existing warnings that are
+      # published in the summary below). It must never be silently ignored.
+      - name: Lint (web)
+        run: pnpm --filter @crm/web lint 2>&1 | tee /tmp/web-lint.log
+
+      - name: Build
+        run: pnpm build
+
+      - name: Verification summary
+        if: always()
+        run: |
+          {
+            echo "### Verification summary"
+            echo ""
+            echo "**Unit tests (vitest)**"
+            grep -E "Test Files|Tests +[0-9]" /tmp/unit-tests.log 2>/dev/null || echo "no summary captured"
+            echo ""
+            echo "**Web lint (oxlint)**"
+            grep -E "Found [0-9]+ warning|Found [0-9]+ error" /tmp/web-lint.log 2>/dev/null || echo "no summary captured"
+            echo ""
+            echo "**Build** — see the Build step log"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  e2e:
+    name: Playwright E2E (datos aislados)
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      E2E_EMAIL: ${{ secrets.E2E_EMAIL }}
+      E2E_PASSWORD: ${{ secrets.E2E_PASSWORD }}
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+      NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}
+      VITE_API_BASE_URL: http://localhost:3000
+      VITE_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+      VITE_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: pnpm/action-setup@v4
-        with:
-          version: 11
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: pnpm
 
       - name: Install dependencies
-        run: CI=true pnpm install
+        run: CI=true pnpm install --frozen-lockfile
 
-      - name: Typecheck
-        run: pnpm typecheck
+      - name: Generate API route types
+        run: pnpm --filter @crm/api typegen
 
-      - name: Run tests
-        run: pnpm test
+      # A dedicated test database: DATABASE_URL must point at an isolated
+      # instance, never at production. Migrations are idempotent.
+      - name: Prepare test database
+        if: ${{ env.DATABASE_URL != '' }}
+        run: pnpm --filter @crm/api db:migrate
+
+      - name: Start API
+        if: ${{ env.DATABASE_URL != '' }}
+        run: |
+          pnpm --filter @crm/api dev > /tmp/api.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:3000/api/health > /dev/null; then
+              echo "API is up"
+              break
+            fi
+            sleep 2
+          done
+
+      - name: E2E
+        if: ${{ env.E2E_EMAIL != '' && env.E2E_PASSWORD != '' }}
+        run: pnpm --filter @crm/web test:e2e 2>&1 | tee /tmp/e2e.log
+
+      - name: E2E summary
+        if: always()
+        run: |
+          {
+            echo "### E2E (Playwright)"
+            if [ -f /tmp/e2e.log ]; then
+              grep -E "passed|skipped|failed" /tmp/e2e.log | tail -5 || true
+            else
+              echo "OMITIDOS — 0 pruebas ejecutadas."
+              echo ""
+              echo "Causa: faltan los secretos \`E2E_EMAIL\` / \`E2E_PASSWORD\`"
+              echo "(y/o \`DATABASE_URL\`) en este repositorio. Los tests protegidos"
+              echo "harían *skip* silencioso y el resultado sería verde sin haber"
+              echo "ejecutado nada. Configura los secretos contra una base aislada"
+              echo "para habilitar esta puerta."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

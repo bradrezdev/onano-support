@@ -25,7 +25,7 @@ Los **clientes** no inician sesión: son registros de control interno. Los **usu
 
 | Capa | Tecnología |
 |---|---|
-| **API** | Next.js 16.4.2 (App Router) · TypeScript strict · Zod 4 · puerto 3000 |
+| **API** | Next.js 16.4.6 (App Router) · TypeScript strict · Zod 4 · puerto 3000 |
 | **Web** | React 19 · Vite · Tailwind v3 · Zustand · React Router v6 · puerto 5173 |
 | **Datos** | Supabase (Postgres + Auth + Realtime + Storage) |
 | **Mensajería** | Twilio WhatsApp (webhooks entrantes + estados) |
@@ -286,10 +286,28 @@ pnpm dev          # API :3000 + Web :5173 en paralelo
 ```bash
 pnpm install / dev / dev:api / dev:web
 pnpm build         # tsc -b + next build + vite build
-pnpm typecheck     # tsc --noEmit en ambos workspaces
+pnpm typecheck     # genera los tipos de ruta de la API y luego tsc --noEmit en ambos workspaces
 pnpm test          # vitest run en api y web
+pnpm lint          # oxlint (solo web)
+pnpm e2e           # Playwright
 pnpm clean
 ```
+
+### Verificación reproducible (la misma que corre CI)
+
+```bash
+CI=true pnpm install --frozen-lockfile   # lockfile congelado
+pnpm --filter @crm/api typegen            # tipos de ruta: DEBEN existir antes de tsc
+pnpm typecheck
+pnpm test
+pnpm --filter @crm/web lint               # informativo: hay deuda de warnings conocida
+pnpm build
+pnpm e2e                                  # requiere E2E_EMAIL/E2E_PASSWORD y una base aislada
+```
+
+`pnpm --filter @crm/api typecheck` ya ejecuta `next typegen` antes de `tsc`: `apps/api` usa el global `LayoutProps` que Next genera, y sin ese paso un checkout limpio falla con `TS2304: Cannot find name 'LayoutProps'`.
+
+Node 22+ (`.nvmrc`), pnpm 11.22.0 (la versión sale de `packageManager`; no la fijes también en la acción de CI o la acción aborta con «Multiple versions of pnpm specified»).
 
 ### Tests
 
@@ -344,7 +362,7 @@ pnpm tsx scripts/make-e2e-admin.ts # admin temporal para E2E (bórralo después)
 
 **Estado actual:** 344 API + 34 web + 18 Playwright = **396 verde**. Build limpio.
 
-> `pnpm lint` sale con código 1: oxlint cuenta los warnings como fallo. Son 25 warnings en 17 archivos, **0 errores**, y la mayoría son preexistentes (`set-state-in-effect` y `exhaustive-deps` en el mismo patrón de carga de datos de casi todas las páginas). No es una regresión sin comparar contra `main` primero.
+> `pnpm lint` hoy sale con **código 0**: oxlint falla por errores, no por warnings. Quedan **24 warnings y 0 errores** — casi todos preexistentes (`set-state-in-effect` y `exhaustive-deps` en el mismo patrón de carga de datos de casi todas las páginas). El error que sí había (`react-hooks/rules-of-hooks` sobre el fixture de Playwright) se corrigió; el conteo se publica en el resumen del job de CI.
 
 ---
 
