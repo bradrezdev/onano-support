@@ -59,7 +59,7 @@ for i in $(seq 1 30); do
   sleep 1
 done
 docker cp "${DUMP}" "${RESTORE_CONTAINER}:/tmp/backup.dump"
-docker exec "${RESTORE_CONTAINER}" pg_restore -U postgres -d postgres --clean --if-exists /tmp/backup.dump > /tmp/restore.log 2>&1 || {
+docker exec "${RESTORE_CONTAINER}" pg_restore -U postgres -d postgres --clean --if-exists --no-owner --no-privileges /tmp/backup.dump > /tmp/restore.log 2>&1 || {
   echo "   La restauración reportó avisos (revisar /tmp/restore.log):" >&2
   tail -5 /tmp/restore.log >&2
 }

@@ -19,7 +19,7 @@ COPY_CONTAINER="crm_legacy_copy"
 COPY_VOLUME="crm_legacy_copy_data"
 DUMP_DIR="${BACKUP_DIR:-$HOME/supabase-dev/backups}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
-DUMP="${DUMP_DIR}/legacy-public-${STAMP}.dump"
+DUMP="${DUMP_DIR}/legacy-public-${STAMP}.sql"
 
 mkdir -p "${DUMP_DIR}"
 
@@ -58,19 +58,33 @@ for intento in range(6):
 print('')
 " "${PGHOST}")"
 if [ -z "${PGHOSTADDR}" ]; then
-  echo "No se pudo resolver la dirección IPv4 de ${PGHOST} (DNS intermitente)." >&2
-  echo "Vuelve a intentarlo: el proyecto anterior sigue siendo accesible en modo consulta." >&2
-  exit 1
+  echo "   (sin IPv4 para ${PGHOST}: se usará el cliente local, que resuelve IPv6)"
+else
+  echo "   destino: ${PGHOST} (${PGHOSTADDR})"
 fi
-echo "   destino: ${PGHOST} (${PGHOSTADDR})"
 
 echo "== 1 · volcado de solo lectura del esquema public del proyecto anterior =="
-# El contenedor escribe el archivo en el directorio del host (montaje), así
-# que el volcado nunca pasa por la línea de comandos.
-docker run --rm -e PGPASSWORD="${PGPASSWORD}" -e PGHOSTADDR="${PGHOSTADDR}" \
-  -v "$(dirname "${DUMP}"):/out" postgres:15 \
-  pg_dump -h "${PGHOST}" -U postgres -d postgres --format=custom --schema=public \
-  --file="/out/$(basename "${DUMP}")" > /dev/null
+# El cliente de postgres del host (libpq) se prefiere al del contenedor: el
+# host resuelve el proyecto anterior por IPv6 y el contenedor no tiene ruta
+# IPv6. Si no hay cliente local, se cae al de la imagen de postgres.
+PG_DUMP_BIN="$(command -v pg_dump || true)"
+if [ -z "${PG_DUMP_BIN}" ] && [ -x /opt/homebrew/opt/libpq/bin/pg_dump ]; then
+  PG_DUMP_BIN=/opt/homebrew/opt/libpq/bin/pg_dump
+fi
+
+if [ -n "${PG_DUMP_BIN}" ]; then
+  echo "   cliente: ${PG_DUMP_BIN}"
+  # Formato TEXTO: el cliente local es más nuevo que el `pg_restore` del
+  # contenedor y el formato "custom" no es compatible entre versiones.
+  PGPASSWORD="${PGPASSWORD}" "${PG_DUMP_BIN}" "${LEGACY_DATABASE_URL}" \
+    --format=plain --schema=public --file="${DUMP}" > /dev/null
+else
+  echo "   cliente: imagen postgres:15 (IPv4)"
+  docker run --rm -e PGPASSWORD="${PGPASSWORD}" -e PGHOSTADDR="${PGHOSTADDR}" \
+    -v "$(dirname "${DUMP}"):/out" postgres:15 \
+    pg_dump -h "${PGHOST}" -U postgres -d postgres --format=plain --schema=public \
+    --file="/out/$(basename "${DUMP}")" > /dev/null
+fi
 echo "   ${DUMP}"
 
 echo
@@ -84,8 +98,11 @@ for i in $(seq 1 30); do
   if docker exec "${COPY_CONTAINER}" pg_isready -U postgres > /dev/null 2>&1; then break; fi
   sleep 1
 done
-docker cp "${DUMP}" "${COPY_CONTAINER}:/tmp/legacy.dump"
-docker exec "${COPY_CONTAINER}" pg_restore -U postgres -d postgres --clean --if-exists /tmp/legacy.dump > /tmp/legacy-restore.log 2>&1 || true
+docker cp "${DUMP}" "${COPY_CONTAINER}:/tmp/legacy.sql"
+# `psql` sigue aunque algún enunciado falle: los GRANT a anon/authenticated
+# no existen en un postgres pelado, y eso es esperable.
+docker exec "${COPY_CONTAINER}" psql -U postgres -d postgres -q -f /tmp/legacy.sql > /tmp/legacy-restore.log 2>&1 || true
+docker exec "${COPY_CONTAINER}" rm -f /tmp/legacy.sql
 echo "   contenedor=${COPY_CONTAINER} volumen=${COPY_VOLUME}"
 echo "   (los avisos de roles son esperables: la copia no tiene los roles de Supabase)"
 
@@ -93,7 +110,7 @@ echo
 echo "== 3 · inventario de lo recuperable =="
 docker exec "${COPY_CONTAINER}" psql -U postgres -d postgres -tAc "
   select 'perfiles='||(select count(*) from public.profiles)
-      ||' contactos='||(select count(*) from public.contacts)
+      ||' clientes='||(select count(*) from public.contacts)
       ||' conversaciones='||(select count(*) from public.conversations)
       ||' mensajes='||(select count(*) from public.messages)
       ||' tickets='||(select count(*) from public.tickets)
@@ -101,11 +118,11 @@ docker exec "${COPY_CONTAINER}" psql -U postgres -d postgres -tAc "
       ||' migraciones='||(select count(*) from public.schema_migrations);"
 
 echo
-echo "== 4 · asignaciones (quién-atendía-qué) =="
+echo "== 4 · asignaciones (por rol del titular; los nombres son datos personales) =="
 docker exec "${COPY_CONTAINER}" psql -U postgres -d postgres -tAc "
-  select coalesce(p.display_name, '(sin perfil)')||' -> '||coalesce(t.name,'(sin ticket)')
+  select coalesce(p.role_key,'(sin perfil)')||': '||count(*)||' ticket(s)'
     from public.tickets t left join public.profiles p on p.id = t.assigned_to
-   order by 1;"
+   group by 1 order by 1;"
 
 echo
 echo "== 5 · roles asignados en los perfiles recuperados =="
