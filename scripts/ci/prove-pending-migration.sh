@@ -45,8 +45,11 @@ fi
 echo "OK · el ejecutor comunificó que la migración quedó PENDIENTE"
 
 ledger=$(pnpm --filter @crm/api db:exec \
-  "select filename from public.schema_migrations where filename = '${PROBE_NAME}'" 2>&1)
-if echo "${ledger}" | grep -q "${PROBE_NAME}"; then
+  "select exists (select 1 from public.schema_migrations where filename = '${PROBE_NAME}') as applied" 2>&1)
+# Se busca el resultado con su formato (fila JSON), no el nombre del archivo:
+# el propio comando impreso por pnpm contiene el nombre y daría un falso
+# positivo.
+if echo "${ledger}" | grep -q '"applied": true'; then
   echo "FALLO: la migración revertida quedó registrada como aplicada:"
   echo "${ledger}"
   exit 1
