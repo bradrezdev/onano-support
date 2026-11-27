@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll } from 'vitest'
 import 'dotenv/config'
 import { createClient } from '@supabase/supabase-js'
+import { Client } from 'pg'
 
 /**
  * E1 · Protección de perfiles — aceptación con usuarios SINTÉTICOS contra una
@@ -69,6 +70,32 @@ async function api(
     body = text
   }
   return { status: res.status, body }
+}
+
+/**
+ * Conección directa, solo para DDL de prueba. El Postgres local no acepta
+ * SSL; el alojado sí. El destino decide.
+ */
+async function sql<T = unknown>(text: string, params: unknown[] = []): Promise<T[]> {
+  const host = (() => {
+    try {
+      return new URL(process.env.DATABASE_URL!).hostname
+    } catch {
+      return ''
+    }
+  })()
+  const local = ['127.0.0.1', 'localhost', '::1'].includes(host)
+  const pg = new Client({
+    connectionString: process.env.DATABASE_URL,
+    ssl: local ? false : { rejectUnauthorized: false },
+  })
+  await pg.connect()
+  try {
+    const res = await pg.query(text, params)
+    return res.rows as T[]
+  } finally {
+    await pg.end()
+  }
 }
 
 describe.skipIf(!enabled)('E1 · quién puede cambiar cada campo protegido', () => {
@@ -194,6 +221,35 @@ describe.skipIf(!enabled)('E1 · quién puede cambiar cada campo protegido', () 
     const browser = createClient(SB_URL!, PUBLISHABLE!, { auth: { persistSession: false } })
     const asAgent = await browser.rpc('resolve_permissions', { p_profile_id: agentId })
     expect(asAgent.error).not.toBeNull()
+  })
+
+  it('el diagnóstico detecta una función con los privilegios por defecto', async () => {
+    // `proacl IS NULL` = privilegios POR DEFECTO de PostgreSQL = EXECUTE para
+    // PUBLIC. Es el caso más peligroso y el que el diagnóstico ignoraba
+    // (trataba la lista nula como una lista vacía).
+    await sql(`create function public.e1_probe_default_privileges() returns int language sql as $$ select 1 $$`)
+    try {
+      const listed = await sql<{ proname: string }>(
+        `select proname from public.app_functions_executable_by_public() where proname = 'e1_probe_default_privileges'`,
+      )
+      expect(listed.length).toBe(1)
+
+      // Y con el privilegio por defecto retirado, deja de aparecer.
+      await sql(`revoke execute on function public.e1_probe_default_privileges() from public`)
+      const after = await sql<{ proname: string }>(
+        `select proname from public.app_functions_executable_by_public() where proname = 'e1_probe_default_privileges'`,
+      )
+      expect(after.length).toBe(0)
+    } finally {
+      await sql(`drop function if exists public.e1_probe_default_privileges()`)
+    }
+  })
+
+  it('ninguna función propia de la app queda ejecutable por PUBLIC', async () => {
+    const rows = await sql<{ proname: string }>(
+      `select proname from public.app_functions_executable_by_public()`,
+    )
+    expect(rows.map((r) => r.proname)).toEqual([])
   })
 
   it('el rol del agente vuelve a soporte (limpieza del caso)', async () => {
