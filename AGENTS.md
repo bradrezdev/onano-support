@@ -1,0 +1,76 @@
+# AGENTS.md — whatsapp-CRM
+
+Internal multi-user WhatsApp CRM for ONANO Global (tickets/incidents + team inbox). pnpm-workspaces monorepo over one Supabase project.
+
+**Sources of truth:** `PRODUCT_SPEC.md` = scope (read before a task; update requirement status after). `CLAUDE.md` / `README.md` = deep architecture docs. `odd/tasks/whatsapp-crm.md` = living ODD feature doc (specs S#, tasks T#, log L#).
+
+**Known doc drift (verified 2026-10):** the root `.env.example` is Fastify-era (it still lists `PORT=4000`, `SUPABASE_ANON_KEY`, `TWILIO_WHATSAPP_NUMBER`) — ignore it; the real layout is the Environment section below.
+
+## Layout
+
+- `apps/api` (`@crm/api`) — Next.js 16.4.6 App Router, :3000. Owns **all** data access via the service-role Supabase client (bypasses RLS). Route handlers in `src/app/api/**`, business logic + SQL in `src/services/**`.
+- `apps/web` (`@crm/web`) — React 19 + Vite SPA, :5173. Supabase JS is used for the **auth session only**; all data goes through the API (`src/lib/api.ts` injects the Bearer token, throws `ApiError(status, code)`).
+- `supabase/migrations/` — schema is raw SQL (no ORM). `db:migrate` tracks applied files in `public.schema_migrations`.
+- `apps/api/scripts/` — `db.ts` (admin SQL) + smoke scripts; all load `apps/api/.env` via dotenv.
+
+## Commands
+
+```bash
+pnpm install                     # pnpm v11 only — never add package-lock.json / yarn.lock
+pnpm dev                         # api :3000 + web :5173 in parallel (dev:api / dev:web alone)
+pnpm build                       # next build + (tsc -b && vite build)
+pnpm typecheck && pnpm test      # api: `next typegen` + tsc --noEmit | web: tsc -b --noEmit
+pnpm lint                        # oxlint — web only
+pnpm e2e                         # Playwright
+
+pnpm --filter @crm/api test src/services/users.test.ts   # single file (tests are colocated: *.test.ts)
+pnpm --filter @crm/api test -t "createUser"              # single case by name
+pnpm --filter @crm/web test:e2e                          # Playwright
+```
+
+- **Reproducible verification = what CI runs:** `CI=true pnpm install --frozen-lockfile` → `pnpm --filter @crm/api typegen` → `pnpm typecheck` → `pnpm test` → `pnpm lint` → `pnpm build` → `pnpm e2e`.
+- **`typegen` is not optional**: `apps/api` uses the `LayoutProps` global that Next generates, so `tsc` without `next typegen` fails on a clean checkout with `TS2304: Cannot find name 'LayoutProps'`. `pnpm --filter @crm/api typecheck` already chains it.
+- **Node 22+** (`.nvmrc`, `engines.node >=22`). pnpm comes from `packageManager` (`pnpm@11.22.0`) only — pinning `version:` in `pnpm/action-setup` as well makes the action abort with "Multiple versions of pnpm specified".
+- **Playwright** auto-starts only the *web* dev server; `apps/api` must already run on :3000 (`BASE_URL=...` skips the webServer). Protected tests **silently skip** without `E2E_EMAIL`/`E2E_PASSWORD` — "all green" can mean zero tests executed.
+- **oxlint exits 1 today**: 24 pre-existing warnings (`set-state-in-effect`, `exhaustive-deps`, `purity`, `no-unused-vars`), **0 errors**. The one error that existed (`react-hooks/rules-of-hooks` on the Playwright fixture) is gone: the fixture callback in `apps/web/e2e/helpers/auth.ts` must NOT be named `use` or anything starting with `use`, or the linter reads it as a React hook. The warnings are not your regression unless the diff vs `main` says so.
+- **DB tools** — superuser via `DATABASE_URL`, bypasses RLS; never point at a shared/prod DB:
+  ```bash
+  pnpm --filter @crm/api db:migrate            # apply supabase/migrations/*.sql in order, idempotent
+  pnpm --filter @crm/api db:exec "<SQL>"       # or db:exec ./file.sql
+  pnpm --filter @crm/api db:query <table>      # select * limit 50
+  pnpm --filter @crm/api db:tables
+  ```
+- **Smoke tests against the real DB** (from `apps/api`): `pnpm tsx scripts/smoke-batch.ts` (services; restores what it modifies), `pnpm tsx scripts/smoke-http.ts` (route handlers on a real minted admin JWT), `pnpm tsx scripts/make-e2e-admin.ts` (temp admin, prints its id — delete after). They create real data. Unit tests mock Supabase and cannot see triggers/constraints; smoke tests caught production-breaking bugs the unit suite missed.
+- **Stale dev servers**: `pnpm -r --parallel` does not kill previous instances → check `lsof -nP -iTCP:3000 -sTCP:LISTEN` before `pnpm dev` (web also dies with EADDRINUSE).
+- `pnpm add` from non-TTY/agent shells needs a `CI=true` prefix (`ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY`). Keep vitest on 2.x (3.x breaks against web's Vite 8 / TS 6 combo).
+
+## Environment
+
+- `apps/api/.env` (gitignored): `SUPABASE_URL`, `SUPABASE_SECRET_KEY` (service role = DB superuser; never in the browser), `DATABASE_URL` (scripts only), `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` (SSR cookie client), `TWILIO_AUTH_TOKEN`, `CORS_ORIGINS` (comma list for prod; dev allows any localhost origin).
+- Env lives in `apps/api/.env`: Next.js reads `.env` and `.env.local`, but the **scripts** use `dotenv/config`, which only reads `.env` — the error message in `src/lib/supabase/admin.ts` pointing at `.env.local` is misleading. Run script commands via `pnpm --filter` (or `cd apps/api`) so cwd is `apps/api`.
+- `apps/web/.env`: `VITE_API_BASE_URL` (defaults to `http://localhost:3000`), `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`.
+
+## Invariants
+
+- **Layers**: routes validate (Zod), check permissions, translate errors to status codes; the business logic and its SQL live in `src/services/`, which throws typed errors carrying `status` + `code`. Several list routes still query the admin client inside the handler (`/api/tickets`, `/api/categories`, `/api/contacts`, `/api/users`) — that is legacy, not the template: new endpoints delegate to a service.
+- **Permissions are data**: `permissions` catalog → `roles` keyring → `profiles.role_key`; SQL `resolve_permissions()` → `/api/me` → SPA. Guard with `requirePermission([...])` from `src/lib/auth.ts`; `requireRole` is legacy — do not use in new code. A PATCH mixing fields with different permissions must require the exact key per field touched (see `PATCH /api/tickets/[id]`). An empty keyring is a valid answer: client `canWith()` checks `permissions != null`, never `length > 0`.
+- **`profiles.role` is legacy**; `role_key` is the truth. Trigger `handle_new_user` owns the `profiles` INSERT on auth signup — user-creating code UPDATEs that row (an INSERT violates `profiles_pkey`; mocks cannot catch this, smoke tests can).
+- **service_role bypasses RLS**, so write restrictions are GRANT/REVOKE, not policies (`ticket_history` is append-only via REVOKE). A policy alone is decorative against the only client the app uses.
+- **Soft delete**: `deleted_at` is an axis separate from `status`. Work lists filter `.is('deleted_at', null)`; trash uses `.not(...)`.
+- **A ticket without `theme_id` is invisible on the board** (Pipeline filters `theme_id != null`). `pipeline_stages` / `conversation_stages` are dead tables (0 rows, 0 code refs); `themes` + `flows` are the live ones ("Proyectos" + fases).
+- **Role color lives in two tables** (`roles.color` badges, `role_color_settings.base_color` message bubbles); the bidirectional mirror lives in the services, not the UI.
+- **Customer identity = E.164-normalized phone**, on write *and* on search (`normalizePhone` in `src/lib/phone.ts`).
+- **`z.strictObject`** when the body allowlist is the point of the endpoint (`/api/me`); other ticket routes use plain `z.object`, so per-field permission gating is their real allowlist.
+- **Schema change** = new migration `<timestamp>_<name>.sql` + `db:migrate`; never edit an applied migration; backend and client contract changes ship in the same commit.
+- **Next.js 16 with `cacheComponents: true`** — not the Next you know: read `node_modules/next/dist/docs/` before writing API code. `next dev` re-injects `apps/api/AGENTS.md`; commit that file along with your work.
+- **Type strictness is per-app, not inherited**: `tsconfig.base.json` is orphaned (nothing extends it). `apps/api/tsconfig.json` runs plain `strict` with **no** `noUncheckedIndexedAccess` — index access there is `T`, not `T | undefined`; only `apps/web/tsconfig.app.json` sets `noUncheckedIndexedAccess: true`. Vitest has `globals: false` (import `describe/it/expect`); alias `@` → `src` in both apps.
+
+## Twilio
+
+- Inbound is real: `POST /api/webhooks/twilio` (+ `/status`) with hand-rolled HMAC-SHA1 signature validation (`src/lib/twilio-signature.ts`; skipped when `TWILIO_AUTH_TOKEN` is unset). Skips and processing errors return **200** so Twilio does not retry in a loop; errors go to the log. **An invalid signature returns 403 — never relax it to 200**, that would accept forged inbound messages.
+- **No outbound sending exists**: nothing calls the Twilio SDK; `appendOutboundMessage` only records to the DB. The signature is validated against `request.url`, which breaks behind a reverse proxy until `WEBHOOK_BASE_URL` is wired in (known pending item).
+
+## Conventions
+
+- Product nomenclature: **"Proyectos"** (not Temas) and **"Clientes"** (not Contactos) — operator decision, do not revert. Clients never log in; users do.
+- Commits: conventional commits matching history style (mostly Spanish subjects), no AI attribution. The `pre-commit` hook runs a GGA code review and **fails the commit** unless it gets a provider and a format-compliant agent: `GGA_PROVIDER=opencode GGA_OPENCODE_AGENT=general git commit -m "..."`. GGA v2.10.1's own config loader is broken on macOS (BSD `sed` rejects its `\xef\xbb\xbf` BOM strip, so `PROVIDER` from `~/.config/gga/config` never loads), and strict mode needs a `STATUS: PASSED|FAILED` line in the first 30 lines of the review — the default agent does not emit it. GGA also requires a root `AGENTS.md` to exist as its rules file.
