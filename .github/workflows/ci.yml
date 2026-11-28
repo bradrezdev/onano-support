@@ -32,6 +32,11 @@ concurrency:
 env:
   E2E_API_URL: http://localhost:3000
   E2E_READ_DEADLINE_MS: '90000'
+  # Los controles de autorización son obligatorios: si el entorno falta, la
+  # suite de aceptación FALLA en vez de omitirse. Un control omitido es un
+  # control PENDIENTE, y un control PENDIENTE no puede pasar en verde.
+  E2E_CONTROLS_REQUIRED: '1'
+  ACCESS_CONTROLS_STRICT: '1'
 
 jobs:
   verify:
@@ -235,14 +240,26 @@ jobs:
 
       # S11/S12: who may change each protected field. Real DB, real tokens.
       # Runs BEFORE Playwright: it is faster and pinpoints a failure exactly.
-      - name: E1 · suite de protección de perfiles (base real)
+      # The JSON reporter leaves a report behind: the gate below proves that
+      # the controls really ran instead of being skipped.
+      - name: E1 + controles de autorización (base real)
         run: |
           set +e
-          pnpm --filter @crm/api test:integration 2>&1 | tee /tmp/e1-integration.log
+          pnpm --filter @crm/api test:integration --reporter=default --reporter=json --outputFile=/tmp/integration-results.json 2>&1 | tee /tmp/e1-integration.log
           code=${PIPESTATUS[0]}
           set -e
           echo "exit_e1_integration=${code}" >> "$GITHUB_ENV"
           exit "${code}"
+
+      # The access controls as a gate of their own: a pending control is a
+      # red job, not a green one.
+      - name: Controles de acceso (veredicto estricto)
+        run: |
+          pnpm --filter @crm/api exec tsx scripts/validate-access-controls.ts --strict 2>&1 | tee /tmp/access-controls.log
+
+      # A control that did not run is a pending control: the job fails.
+      - name: Count access controls
+        run: node scripts/ci/count-access-controls.mjs /tmp/integration-results.json 20
 
       - name: E2E (Playwright, autenticado)
         env:
@@ -278,12 +295,19 @@ jobs:
               echo "OMITIDOS — 0 pruebas ejecutadas."
             fi
             echo ""
-            echo "**E1 · suite de protección de perfiles**"
+            echo "**E1 + controles de autorización**"
             if [ -f /tmp/e1-integration.log ]; then
               grep -E "Test Files|Tests +[0-9]" /tmp/e1-integration.log | tail -4 || true
               echo "exit code: \`${exit_e1_integration:-n/d}\`"
             else
               echo "OMITIDA — la suite no llegó a ejecutarse."
+            fi
+            echo ""
+            echo "**Controles de acceso**"
+            if [ -f /tmp/access-controls.log ]; then
+              grep -E "^\[OK\]|^\[PENDIENTE\]|VEREDICTO" /tmp/access-controls.log || true
+            else
+              echo "OMITIDOS — el veredicto no llegó a ejecutarse."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 

@@ -11,6 +11,10 @@
  * un informe, y el veredicto final dice si el entorno puede recibir datos
  * reales. Un control pendiente significa entorno sintético.
  *
+ * Con `--strict` (o con `ACCESS_CONTROLS_STRICT=1`) el script sale con código
+ * 1 si algún control queda PENDIENTE: es la puerta que usa el CI, donde un
+ * control que no se puede verificar NO puede pasar en verde.
+ *
  *   cd apps/api && pnpm tsx scripts/validate-access-controls.ts
  */
 import 'dotenv/config'
@@ -23,7 +27,16 @@ const SERVICE = process.env.SUPABASE_SECRET_KEY
 const ADMIN_EMAIL = process.env.E2E_ADMIN_EMAIL ?? 'e2e.admin@example.test'
 const AGENT_EMAIL = process.env.E2E_AGENT_EMAIL ?? 'e2e.agent@example.test'
 const AGENT2_EMAIL = process.env.E2E_AGENT2_EMAIL ?? 'e2e.agent2@example.test'
+/**
+ * Agente sin ningún ticket ni chat: es el que debe recibir 403 en los
+ * controles de aislamiento. No puede ser "el que perdió la toma", porque ese
+ * puede ser el titular del ticket sembrado.
+ */
+const OUTSIDER_EMAIL = 'e2e.outsider@example.test'
 const PASSWORD = process.env.E2E_PASSWORD ?? 'E2E-sintetico-9931'
+
+const strict =
+  process.env.ACCESS_CONTROLS_STRICT === '1' || process.argv.includes('--strict')
 
 type Verdict = 'OK' | 'PENDIENTE'
 const results: { control: string; verdict: Verdict; detail: string }[] = []
@@ -84,6 +97,7 @@ async function main() {
   }
   const agentId = idOf(AGENT_EMAIL)
   const agent2Id = idOf(AGENT2_EMAIL)
+  const adminId = idOf(ADMIN_EMAIL)
 
   // Conversación SIN titular, para la toma simultánea.
   const { data: contact } = await service
@@ -173,11 +187,11 @@ async function main() {
     method: 'POST',
     body: { body: 'Mensaje de un agente que no es el titular' },
   })
-  if (messages.status === 403 || messages.status === 404) {
+  if ([403, 404, 409].includes(messages.status)) {
     report(
       'B2 · envío de mensajes a la conversación ajena',
       'OK',
-      `el agente ajeno recibe ${messages.status}`,
+      `el agente ajeno recibe ${messages.status} y el mensaje NO se guarda`,
     )
   } else {
     report(
@@ -188,7 +202,26 @@ async function main() {
   }
 
   if (ticket) {
-    const att = await call(outsiderToken, `/api/tickets/${ticket.id}/attachments`)
+    // Un agente que no tiene ningún ticket ni chat: el único al que se le
+    // puede pedir el 403 sin que el resultado dependa de quién ganó la toma.
+    const { data: existingOutsiders } = await service.auth.admin.listUsers({
+      page: 1,
+      perPage: 200,
+    })
+    const previousOutsider = existingOutsiders?.users.find(
+      (u) => u.email?.toLowerCase() === OUTSIDER_EMAIL,
+    )
+    if (previousOutsider) await service.auth.admin.deleteUser(previousOutsider.id)
+    const { error: createOutsiderErr } = await service.auth.admin.createUser({
+      email: OUTSIDER_EMAIL,
+      password: PASSWORD,
+      email_confirm: true,
+      user_metadata: { display_name: 'E2E Agente Ajeno' },
+    })
+    if (createOutsiderErr) throw new Error(`outsider: ${createOutsiderErr.message}`)
+    const outsiderToken2 = await signIn(OUTSIDER_EMAIL)
+
+    const att = await call(outsiderToken2, `/api/tickets/${ticket.id}/attachments`)
     if (att.status === 403 || att.status === 404) {
       report('B3 · adjuntos del ticket ajeno', 'OK', `recibe ${att.status}`)
     } else {
@@ -203,15 +236,22 @@ async function main() {
   // ---------------------------------------------------------------------
   // C · Transferencia autorizada: cambia el titular y queda registrada
   // ---------------------------------------------------------------------
-  const { data: beforeOwner } = await service
+  const { data: beforeOwner, error: bErr } = await service
     .from('conversations')
-    .select('assigned_agent_id')
+    .select('assigned_agent_id, assignment_version')
     .eq('id', convId)
-    .single<{ assigned_agent_id: string | null }>()
+    .single<{ assigned_agent_id: string | null; assignment_version: number }>()
+  if (bErr) throw new Error(`conversations: ${bErr.message}`)
 
+  // La transferencia exige motivo y versión vigente.
+  const reason = 'control de validación: devolución a la cola'
   const transfer = await call(adminToken, `/api/conversations/${convId}`, {
     method: 'PATCH',
-    body: { assigned_agent_id: null },
+    body: {
+      assigned_agent_id: null,
+      reason,
+      expected_version: beforeOwner?.assignment_version ?? 1,
+    },
   })
   const { data: afterOwner } = await service
     .from('conversations')
@@ -232,31 +272,40 @@ async function main() {
   }
 
   // ¿Queda rastro de QUIÉN la hizo y POR QUÉ?
-  const { count: historyRows } = await service
-    .from('ticket_history')
-    .select('id', { count: 'exact', head: true })
-  const reasonAccepted = await call(adminToken, `/api/conversations/${convId}`, {
-    method: 'PATCH',
-    body: { assigned_agent_id: null, reason: 'prueba' },
-  })
-  const hasReason =
-    reasonAccepted.status === 400
-      ? 'el cuerpo NO acepta motivo (rechazado por el allowlist)'
-      : 'el cuerpo acepta un campo extra, pero no queda registrado'
+  const { data: auditRows, error: auditErr } = await service
+    .from('conversation_audit_log')
+    .select(
+      'actor_id, previous_assignee_id, new_assignee_id, reason, version_before, version_after, created_at',
+    )
+    .eq('conversation_id', convId)
+    .order('created_at', { ascending: false })
+    .limit(1)
+  if (auditErr) throw new Error(`conversation_audit_log: ${auditErr.message}`)
 
-  if (historyRows === 0) {
+  const entry = auditRows?.[0]
+  const complete =
+    Boolean(entry) &&
+    entry?.actor_id === adminId &&
+    entry?.reason === reason &&
+    Boolean(entry?.created_at) &&
+    entry?.version_after === (entry?.version_before ?? 0) + 1
+
+  if (complete) {
     report(
       'C2 · la transferencia queda registrada (quién y por qué)',
-      'PENDIENTE',
-      `no existe bitácora de conversaciones (ticket_history=${historyRows} filas, ` +
-        `que es de tickets): ${hasReason}.`,
+      'OK',
+      `bitácora: actor=${String(entry?.actor_id).slice(0, 8)}… ` +
+        `anterior=${String(entry?.previous_assignee_id ?? 'null').slice(0, 8)}… ` +
+        `nuevo=${String(entry?.new_assignee_id ?? 'null').slice(0, 8)}… ` +
+        `motivo="${entry?.reason}" fecha=${entry?.created_at}`,
     )
   } else {
     report(
       'C2 · la transferencia queda registrada (quién y por qué)',
       'PENDIENTE',
-      `ticket_history tiene ${historyRows} filas, pero las conversaciones no ` +
-        `tienen bitácora propia: ${hasReason}.`,
+      entry
+        ? `la entrada existe pero no está completa: ${JSON.stringify(entry)}`
+        : 'no hay entrada en conversation_audit_log para esta transferencia.',
     )
   }
 
@@ -273,6 +322,13 @@ async function main() {
     console.log('Controles pendientes:')
     for (const p of pending) console.log(`  · ${p.control}`)
     console.log('El entorno se mantiene con datos SINTÉTICOS.')
+    // En modo estricto (CI) un control pendiente es un job en rojo: una
+    // puerta que no se puede verificar no puede pasar en verde.
+    if (strict) {
+      console.error('')
+      console.error(`FALLO: ${pending.length} control(es) PENDIENTE: la puerta de acceso no puede quedar en verde.`)
+      process.exitCode = 1
+    }
   } else {
     console.log('VEREDICTO: los controles verificados pasan.')
   }
