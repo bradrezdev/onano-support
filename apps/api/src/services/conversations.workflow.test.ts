@@ -17,6 +17,7 @@ class QueryMock {
   }
   select(...args: unknown[]) { return this.record('select', args) }
   eq(col: string, val: unknown) { return this.record('eq', [col, val]) }
+  or(filter: string) { return this.record('or', [filter]) }
   is(col: string, val: unknown) { return this.record('is', [col, val]) }
   not(col: string, op: string, val: unknown) { return this.record('not', [col, op, val]) }
   in(col: string, vals: unknown[]) { return this.record('in', [col, vals]) }
@@ -114,9 +115,11 @@ describe('listConversations', () => {
       assigned_agent_id: 'sop-1',
       include_unassigned: true,
     })
-    const inOp = q.ops.find((o) => o.op === 'in')
-    expect(inOp?.args[0]).toBe('assigned_agent_id')
-    expect(inOp?.args[1]).toEqual(['sop-1', null])
+    // The queue is an OR. A null inside a uuid `in` list is a hard 500 in
+    // Postgres (it is not an "IS NULL" test).
+    const orOp = q.ops.find((o) => o.op === 'or')
+    expect(orOp?.args[0]).toBe('assigned_agent_id.eq.sop-1,assigned_agent_id.is.null')
+    expect(q.ops.some((o) => o.op === 'in')).toBe(false)
   })
 })
 

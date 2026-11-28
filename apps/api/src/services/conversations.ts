@@ -156,8 +156,16 @@ export async function listConversations(filter: {
 
   if (filter.assigned_agent_id) {
     if (filter.include_unassigned) {
-      // OR of "mine" + "nobody's" — PostgREST: assigned_agent_id=eq.X,assigned_agent_id=is.null
-      q = q.in('assigned_agent_id', [filter.assigned_agent_id, null])
+      // OR de "mío" + "de nadie": PostgREST
+      // assigned_agent_id=eq.X,assigned_agent_id=is.null
+      //
+      // Antes era `in('assigned_agent_id', [id, null])`, y Postgres rechazaba
+      // el null como uuid ("invalid input syntax for type uuid"): el listado
+      // de un agente de soporte respondía 500 y la cola —los chats sin
+      // titular— era invisible para quien la trabaja.
+      q = q.or(
+        `assigned_agent_id.eq.${filter.assigned_agent_id},assigned_agent_id.is.null`,
+      )
     } else {
       q = q.eq('assigned_agent_id', filter.assigned_agent_id)
     }

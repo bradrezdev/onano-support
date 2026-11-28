@@ -1,40 +1,48 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
-// ---------------------------------------------------------------------------
-// Mocks
-// ---------------------------------------------------------------------------
+/**
+ * E3 · Webhook entrante de WhatsApp — el contrato actual.
+ *
+ * El límite que se falsea es la BASE (`service_role`): la ruta y el servicio
+ * se ejecutan de verdad, así que lo que se afirma aquí es el comportamiento
+ * observable, no una maqueta.
+ *
+ * Las reglas fijadas:
+ *   · sin `TWILIO_AUTH_TOKEN` → 503 y NADA escrito (la validación nunca se
+ *     omite: una entrada externa sin credencial no se acepta).
+ *   · sin `WEBHOOK_BASE_URL` → 503 y NADA escrito: sin la URL pública no se
+ *     puede saber qué firmó Twilio.
+ *   · firma inválida (o ausente) → 403 y NADA escrito.
+ *   · la firma se valida contra la URL PÚBLICA, no contra `request.url`.
+ *   · la recepción guardada se acusa con TwiML vacío.
+ *   · el cliente desconocido NO se descarta: se crea y su chat entra en la cola.
+ *   · un `MessageSid` repetido se acusa con TwiML vacío y no duplica nada.
+ *   · un fallo de almacenamiento responde 5xx, NUNCA 200.
+ */
 
-// Mock the conversation service to control the full webhook flow per test.
-const mockFindContact = vi.fn()
-const mockFindOrCreate = vi.fn()
-const mockAppendInbound = vi.fn()
-
-vi.mock('@/services/conversations', () => ({
-  findContactByWhatsappNumber: (...args: unknown[]) => mockFindContact(...args),
-  findOrCreateConversationForContact: (...args: unknown[]) => mockFindOrCreate(...args),
-  appendInboundMessage: (...args: unknown[]) => mockAppendInbound(...args),
-}))
-
-// Auth token is read from process.env; tests set it per case.
-const { POST } = await import('./route')
-
-beforeEach(() => {
-  mockFindContact.mockReset()
-  mockFindOrCreate.mockReset()
-  mockAppendInbound.mockReset()
+const mockValidateRequest = vi.fn()
+vi.mock('twilio', () => {
+  const api = {
+    validateRequest: (...args: unknown[]) => mockValidateRequest(...args),
+  }
+  return { default: api, validateRequest: api.validateRequest }
 })
 
-// Build a Twilio-style POST with x-www-form-urlencoded body.
-function twilioPost(url: string, fields: Record<string, string>, signature?: string) {
-  const body = new URLSearchParams(fields).toString()
-  const headers: Record<string, string> = {
-    'content-type': 'application/x-www-form-urlencoded',
-  }
-  if (signature) headers['x-twilio-signature'] = signature
-  return new Request(url, { method: 'POST', body, headers })
-}
+const mockRpc = vi.fn()
+vi.mock('@/lib/supabase/admin', () => ({
+  createSupabaseAdminClient: () => ({
+    rpc: (...args: unknown[]) => mockRpc(...args),
+  }),
+}))
 
-const WEBHOOK_URL = 'http://x/api/webhooks/twilio'
+const { POST } = await import('./route')
+
+const AUTH_TOKEN = 'token-de-prueba'
+const PUBLIC_BASE = 'https://api.example.com'
+const REQUEST_URL = 'http://localhost:3000/api/webhooks/twilio'
+const PUBLIC_URL = 'https://api.example.com/api/webhooks/twilio'
+const EMPTY_TWIML = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>'
+
 const BASE_FIELDS = {
   From: 'whatsapp:+5491145678901',
   To: 'whatsapp:+14155550001',
@@ -43,151 +51,208 @@ const BASE_FIELDS = {
   NumMedia: '0',
 }
 
+/** Lo que devuelve la función de aceptación cuando el mensaje es nuevo. */
+const ACCEPTED = {
+  conversation_id: 'c-1',
+  message_id: 'm-1',
+  contact_id: 'co-1',
+  inserted: true,
+  status: 'open',
+  unread_count: 1,
+}
+
+/** Lo que devuelve cuando el `MessageSid` ya estaba guardado. */
+const ALREADY_STORED = { ...ACCEPTED, message_id: 'm-0', inserted: false, unread_count: 1 }
+
+function twilioPost(
+  fields: Record<string, string>,
+  signature: string | null = 'firma-valida',
+  url: string = REQUEST_URL,
+): Request {
+  const headers: Record<string, string> = {
+    'content-type': 'application/x-www-form-urlencoded',
+  }
+  if (signature !== null) headers['x-twilio-signature'] = signature
+  return new Request(url, { method: 'POST', body: new URLSearchParams(fields).toString(), headers })
+}
+
+beforeEach(() => {
+  mockRpc.mockReset()
+  mockValidateRequest.mockReset()
+  mockValidateRequest.mockReturnValue(true)
+  mockRpc.mockResolvedValue({ data: [ACCEPTED], error: null })
+  process.env.TWILIO_AUTH_TOKEN = AUTH_TOKEN
+  process.env.WEBHOOK_BASE_URL = PUBLIC_BASE
+})
+
 // ---------------------------------------------------------------------------
-// Signature
+// Credencial y URL pública: se rechaza ANTES de escribir
 // ---------------------------------------------------------------------------
 
-describe('POST /api/webhooks/twilio — signature', () => {
-  beforeEach(() => {
-    // Dev mode: no TWILIO_AUTH_TOKEN env var → signature check is skipped.
+describe('POST /api/webhooks/twilio — sin credencial', () => {
+  it('sin TWILIO_AUTH_TOKEN responde 503 y NO escribe nada', async () => {
     delete process.env.TWILIO_AUTH_TOKEN
+
+    const res = await POST(twilioPost(BASE_FIELDS))
+
+    expect(res.status).toBe(503)
+    expect(mockValidateRequest).not.toHaveBeenCalled()
+    expect(mockRpc).not.toHaveBeenCalled()
   })
 
-  it('returns 403 invalid_signature when TWILIO_AUTH_TOKEN is set and signature mismatches', async () => {
-    process.env.TWILIO_AUTH_TOKEN = 'real-token'
-    mockFindContact.mockResolvedValue({ id: 'co-1' })
-    const res = await POST(twilioPost(WEBHOOK_URL, BASE_FIELDS, 'bogus'))
+  it('sin WEBHOOK_BASE_URL responde 503 y NO escribe nada', async () => {
+    delete process.env.WEBHOOK_BASE_URL
+
+    const res = await POST(twilioPost(BASE_FIELDS))
+
+    expect(res.status).toBe(503)
+    expect(mockRpc).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Firma
+// ---------------------------------------------------------------------------
+
+describe('POST /api/webhooks/twilio — firma', () => {
+  it('una firma inválida responde 403 y NO escribe nada', async () => {
+    mockValidateRequest.mockReturnValue(false)
+
+    const res = await POST(twilioPost(BASE_FIELDS, 'firma-falsa'))
+
     expect(res.status).toBe(403)
     const body = (await res.json()) as { code: string }
     expect(body.code).toBe('invalid_signature')
-    expect(mockFindContact).not.toHaveBeenCalled()
+    expect(mockRpc).not.toHaveBeenCalled()
   })
 
-  it('skips signature check in dev mode (no token) and processes the message', async () => {
-    mockFindContact.mockResolvedValue({ id: 'co-1' })
-    mockFindOrCreate.mockResolvedValue({ id: 'c-1' })
-    mockAppendInbound.mockResolvedValue({ id: 'm-1' })
-    const res = await POST(twilioPost(WEBHOOK_URL, BASE_FIELDS))
+  it('sin cabecera de firma responde 403 y NO escribe nada', async () => {
+    const res = await POST(twilioPost(BASE_FIELDS, null))
+
+    expect(res.status).toBe(403)
+    expect(mockRpc).not.toHaveBeenCalled()
+  })
+
+  it('valida la firma contra la URL PÚBLICA, no contra request.url', async () => {
+    // Detrás de un proxy, `request.url` es la URL interna: validar contra
+    // ella rechazaría toda petición legítima con 403.
+    const res = await POST(twilioPost(BASE_FIELDS))
+
     expect(res.status).toBe(200)
-    expect(mockFindContact).toHaveBeenCalledWith('whatsapp:+5491145678901')
+    expect(mockValidateRequest).toHaveBeenCalledWith(
+      AUTH_TOKEN,
+      'firma-valida',
+      PUBLIC_URL,
+      expect.objectContaining({ MessageSid: 'SMabc123' }),
+    )
   })
 })
 
 // ---------------------------------------------------------------------------
-// Skip paths
+// Recepción guardada: el acuse es TwiML vacío
 // ---------------------------------------------------------------------------
 
-describe('POST /api/webhooks/twilio — skip paths (always 200)', () => {
-  beforeEach(() => {
-    delete process.env.TWILIO_AUTH_TOKEN
-  })
+describe('POST /api/webhooks/twilio — recepción', () => {
+  it('la recepción guardada se acusa con TwiML vacío', async () => {
+    const res = await POST(twilioPost(BASE_FIELDS))
 
-  it('returns 200 ok:skipped when From is missing', async () => {
-    const { From, ...rest } = BASE_FIELDS
-    void From
-    const res = await POST(twilioPost(WEBHOOK_URL, rest))
     expect(res.status).toBe(200)
-    const body = (await res.json()) as { ok: boolean; skipped: string }
-    expect(body.ok).toBe(true)
-    expect(body.skipped).toContain('missing')
-    expect(mockFindContact).not.toHaveBeenCalled()
+    expect(res.headers.get('content-type')).toContain('text/xml')
+    expect(await res.text()).toBe(EMPTY_TWIML)
+    expect(mockRpc).toHaveBeenCalledTimes(1)
   })
 
-  it('returns 200 ok:skipped when MessageSid is missing', async () => {
-    const { MessageSid, ...rest } = BASE_FIELDS
-    void MessageSid
-    const res = await POST(twilioPost(WEBHOOK_URL, rest))
+  it('el cliente desconocido NO se descarta: se crea y su chat entra en la cola', async () => {
+    // Antes respondía 200 { skipped: 'unknown_contact' } y el mensaje se
+    // perdía. Ahora la aceptación crea al cliente y abre su hilo.
+    const res = await POST(twilioPost(BASE_FIELDS))
+
     expect(res.status).toBe(200)
-    const body = (await res.json()) as { ok: boolean; skipped: string }
-    expect(body.skipped).toContain('missing')
+    expect(mockRpc).toHaveBeenCalledWith(
+      'accept_inbound_whatsapp',
+      expect.objectContaining({ p_phone: '+5491145678901', p_twilio_sid: 'SMabc123' }),
+    )
+    expect(await res.text()).not.toContain('unknown_contact')
   })
 
-  it('returns 200 ok:skipped unknown_contact when contact is not in CRM', async () => {
-    mockFindContact.mockResolvedValue(null)
-    const res = await POST(twilioPost(WEBHOOK_URL, BASE_FIELDS))
+  it('un MessageSid repetido se acusa con TwiML vacío y no duplica nada', async () => {
+    mockRpc.mockResolvedValue({ data: [ALREADY_STORED], error: null })
+
+    const res = await POST(twilioPost(BASE_FIELDS))
+
     expect(res.status).toBe(200)
-    const body = (await res.json()) as { ok: boolean; skipped: string; from: string }
-    expect(body.skipped).toBe('unknown_contact')
-    expect(body.from).toBe('whatsapp:+5491145678901')
-    expect(mockFindOrCreate).not.toHaveBeenCalled()
-    expect(mockAppendInbound).not.toHaveBeenCalled()
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Happy path
-// ---------------------------------------------------------------------------
-
-describe('POST /api/webhooks/twilio — happy path', () => {
-  beforeEach(() => {
-    delete process.env.TWILIO_AUTH_TOKEN
+    expect(await res.text()).toBe(EMPTY_TWIML)
+    // La base decide: no insertó, y la ruta no lo reintenta ni inventa otro.
+    expect(mockRpc).toHaveBeenCalledTimes(1)
   })
 
-  it('finds contact, finds-or-creates conversation, appends message idempotently', async () => {
-    mockFindContact.mockResolvedValue({ id: 'co-1', whatsapp_number: '+5491145678901', name: 'Alice' })
-    mockFindOrCreate.mockResolvedValue({ id: 'c-1', contact_id: 'co-1' })
-    mockAppendInbound.mockResolvedValue({ id: 'm-1' })
-    const res = await POST(twilioPost(WEBHOOK_URL, BASE_FIELDS))
-    expect(res.status).toBe(200)
-    const body = (await res.json()) as { ok: boolean; conversation_id: string }
-    expect(body.ok).toBe(true)
-    expect(body.conversation_id).toBe('c-1')
-    expect(mockAppendInbound).toHaveBeenCalledWith({
-      conversation_id: 'c-1',
-      body: 'hola',
-      twilio_sid: 'SMabc123',
-      media_urls: [],
-    })
-  })
-
-  it('passes media_urls when NumMedia > 0', async () => {
-    mockFindContact.mockResolvedValue({ id: 'co-1' })
-    mockFindOrCreate.mockResolvedValue({ id: 'c-1' })
-    mockAppendInbound.mockResolvedValue({ id: 'm-1' })
-    const res = await POST(
-      twilioPost(WEBHOOK_URL, {
+  it('los medios se pasan a la aceptación', async () => {
+    await POST(
+      twilioPost({
         ...BASE_FIELDS,
         NumMedia: '2',
         MediaUrl0: 'https://m.example/a.jpg',
         MediaUrl1: 'https://m.example/b.jpg',
       }),
     )
-    expect(res.status).toBe(200)
-    const call = mockAppendInbound.mock.calls[0]![0] as { media_urls: string[] }
-    expect(call.media_urls).toEqual(['https://m.example/a.jpg', 'https://m.example/b.jpg'])
+
+    expect(mockRpc).toHaveBeenCalledWith(
+      'accept_inbound_whatsapp',
+      expect.objectContaining({
+        p_media_urls: ['https://m.example/a.jpg', 'https://m.example/b.jpg'],
+      }),
+    )
   })
 
-  it('passes null body when Body is missing', async () => {
-    mockFindContact.mockResolvedValue({ id: 'co-1' })
-    mockFindOrCreate.mockResolvedValue({ id: 'c-1' })
-    mockAppendInbound.mockResolvedValue({ id: 'm-1' })
+  it('sin Body el mensaje se guarda con cuerpo null', async () => {
     const { Body, ...rest } = BASE_FIELDS
     void Body
-    const res = await POST(twilioPost(WEBHOOK_URL, rest))
-    expect(res.status).toBe(200)
-    const call = mockAppendInbound.mock.calls[0]![0] as { body: string | null }
-    expect(call.body).toBeNull()
+
+    await POST(twilioPost(rest))
+
+    expect(mockRpc).toHaveBeenCalledWith(
+      'accept_inbound_whatsapp',
+      expect.objectContaining({ p_body: null }),
+    )
+  })
+
+  it('una carga incompleta responde 400 y NO escribe nada', async () => {
+    const { From, ...rest } = BASE_FIELDS
+    void From
+
+    const res = await POST(twilioPost(rest))
+
+    expect(res.status).toBe(400)
+    expect(mockRpc).not.toHaveBeenCalled()
+  })
+
+  it('sin MessageSid responde 400 y NO escribe nada', async () => {
+    const { MessageSid, ...rest } = BASE_FIELDS
+    void MessageSid
+
+    const res = await POST(twilioPost(rest))
+
+    expect(res.status).toBe(400)
+    expect(mockRpc).not.toHaveBeenCalled()
   })
 })
 
 // ---------------------------------------------------------------------------
-// Failure path (always 200 to Twilio)
+// Fallo de almacenamiento: 5xx, nunca 200
 // ---------------------------------------------------------------------------
 
-describe('POST /api/webhooks/twilio — error swallowing (always 200)', () => {
-  beforeEach(() => {
-    delete process.env.TWILIO_AUTH_TOKEN
-  })
-
-  it('returns 200 with error message when service throws', async () => {
-    mockFindContact.mockResolvedValue({ id: 'co-1' })
-    mockFindOrCreate.mockRejectedValue(new Error('db down'))
+describe('POST /api/webhooks/twilio — fallo de almacenamiento', () => {
+  it('un fallo de almacenamiento responde 5xx, NUNCA 200', async () => {
+    mockRpc.mockResolvedValue({ data: null, error: { message: 'db down' } })
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
-    const res = await POST(twilioPost(WEBHOOK_URL, BASE_FIELDS))
-    expect(res.status).toBe(200)
-    const body = (await res.json()) as { ok: boolean; error: string }
-    expect(body.ok).toBe(true)
-    expect(body.error).toBe('db down')
+
+    const res = await POST(twilioPost(BASE_FIELDS))
+
+    expect(res.status).toBeGreaterThanOrEqual(500)
+    expect(res.status).toBeLessThan(600)
+    expect(res.status).not.toBe(200)
+    const body = (await res.json()) as { code: string }
+    expect(body.code).toBe('storage_unavailable')
     expect(errSpy).toHaveBeenCalled()
     errSpy.mockRestore()
   })
