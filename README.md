@@ -205,28 +205,47 @@ Un rol sin llaves es una **respuesta válida, no un fallo**: existe, se ve vací
 | Variable | Para qué | Estado |
 |---|---|---|
 | `TWILIO_ACCOUNT_SID` | Identificador de la cuenta | Configurada; **sin uso en código** |
-| `TWILIO_AUTH_TOKEN` | Verificación de firma HMAC-SHA1 | **En uso** |
+| `TWILIO_AUTH_TOKEN` | Credencial con la que se valida la firma (SDK de Twilio) | **En uso y obligatoria** |
 | `TWILIO_WHATSAPP_FROM` | Número emisor | Configurada; **sin uso en código** |
-| `WEBHOOK_BASE_URL` | URL pública para validar la firma | Configurada; **sin uso en código** |
+| `WEBHOOK_BASE_URL` | Origen **público** del webhook: la URL contra la que se valida la firma | **En uso y obligatoria** |
+
+> Sin `TWILIO_AUTH_TOKEN` o sin `WEBHOOK_BASE_URL` el webhook responde **503** y no escribe nada: la validación de la firma nunca se omite.
 
 ### Webhooks
 
 | Ruta | Método | Qué hace |
 |---|---|---|
-| `/api/webhooks/twilio` | POST | Mensajes entrantes. Valida firma, busca el cliente por `From`, crea la conversación si hace falta y registra el mensaje |
+| `/api/webhooks/twilio` | POST | Mensajes entrantes. Valida la firma, crea el cliente si no existe, reutiliza (y reabre) su hilo del canal y registra el mensaje |
 | `/api/webhooks/twilio/status` | POST | Estados de entrega (`queued`, `sent`, `delivered`, `read`, `failed`), correlacionados por `MessageSid` |
 
 Para configurarlos en la consola de Twilio, apuntá el webhook de mensajes a `https://<tu-dominio>/api/webhooks/twilio` (método POST) y el de estados a `https://<tu-dominio>/api/webhooks/twilio/status`.
 
 ### Validación de firma
 
-Implementada a mano, sin el paquete `twilio` oficial (`src/lib/twilio-signature.ts`): se concatena la URL completa con las claves y valores del POST ordenados alfabéticamente, se aplica HMAC-SHA1 con el Auth Token, se codifica en base64 y se compara en **tiempo constante** contra `X-Twilio-Signature`. Si `TWILIO_AUTH_TOKEN` no está definida, la validación se salta (modo desarrollo) — en producción debe estar definida.
+Con el paquete oficial `twilio` (`twilio.validateRequest`), contra la **URL pública**: `WEBHOOK_BASE_URL` (origen) + la ruta + el query string. **No** contra `request.url` de Next: detrás de un proxy el esquema/host/puerto son los internos y toda petición legítima caería en 403.
+
+El fragmento de la URL no entra en el cálculo de la firma (ahí viajan los overrides de conexión de Twilio), así que la URL pública se reconstruye sin él.
+
+### Recepción entrante
+
+Todo el camino entrante se resuelve en **una** transacción (`accept_inbound_whatsapp`, `SECURITY DEFINER`, con bloqueo de aviso por cliente):
+
+- El cliente se busca por número normalizado y **se crea si no existe** (con el nombre de perfil de WhatsApp cuando viene). Antes se descartaba.
+- El hilo se busca por **(cliente, canal)** — `conversations.channel` — y se **reutiliza**. Si estaba `closed`, se **reabre** con el mismo `conversation_id`: no se crea un segundo hilo.
+- El mensaje se inserta **ignorando un `MessageSid` repetido**, y la operación devuelve si se insertó de verdad: el contador de no leídos se mueve **una** vez.
+
+El **acuse** es TwiML vacío (`<?xml version="1.0" encoding="UTF-8"?><Response></Response>`) y solo se emite cuando la recepción quedó guardada o se comprobó que ya lo estaba. Un `MessageSid` repetido recibe el mismo TwiML vacío: Twilio no debe reintentar un evento ya procesado.
+
+Un **fallo temporal de almacenamiento responde 5xx, nunca 200**: un 200 sería un mensaje perdido sin que nadie lo note.
+
+### Política de reintentos (piloto)
+
+Por defecto Twilio reintenta **una** vez y solo ante fallo de conexión (`rc=1`, `rp=ct`): **un 5xx no se reintenta**. Para que se reintente hay que configurar la URL del webhook en la consola de Twilio con los overrides de conexión (`#rc=3&rp=5xx,ct,rt`) o con la Webhooks configuration API. Esos overrides viajan en el **fragmento** de la URL, que no forma parte de la firma. Es un requisito de configuración de la consola, no de código.
 
 ### Qué NO está cableado
 
-- **No hay envío saliente.** No existe una llamada al SDK de Twilio: nada manda por WhatsApp todavía. `appendOutboundMessage` registra el mensaje en la base pero no lo transmite.
-- **La firma se valida contra `request.url`**, que detrás de un proxy es la URL interna, no la pública. `WEBHOOK_BASE_URL` existe en el `.env` justamente para esto y aún no se usa: **si despliegas detrás de un reverse proxy, la validación va a fallar hasta que se use**. Es el pendiente #1 de Twilio.
-- Los webhooks respondieron **siempre 200**, incluso al fallar el procesamiento, para que Twilio no reintente en bucle. Los errores se registran en el log.
+- **No hay envío saliente.** No existe una llamada de envío al SDK de Twilio: nada manda por WhatsApp todavía. `appendOutboundMessage` registra el mensaje en la base pero no lo transmite.
+
 
 ---
 
@@ -432,9 +451,10 @@ apps/
                             #   roles, themes, categories, webhooks, me, dashboard…)
     src/middleware.ts        # CORS — sin él el SPA ve "Load failed"
     src/lib/                # auth.ts, permissions.ts, phone.ts, sanitize.ts,
-                            #   validate.ts, twilio-signature.ts, supabase/{server,admin}
+                            #   validate.ts, supabase/{server,admin}
     src/services/           # lógica de negocio y queries (tickets, conversations,
-                            #   users, roles, themes, categories, audit, inbox, …)
+                            #   users, roles, themes, categories, audit, inbox,
+                            #   whatsapp-inbound…)
     scripts/                # db.ts (admin SQL) + smoke scripts
   web/                      # React 19 + Vite
     src/pages/              # Login, Dashboard, Inbox, ConversationDetail, Contacts,

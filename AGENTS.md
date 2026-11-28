@@ -97,8 +97,12 @@ pnpm --filter @crm/web test:e2e                          # Playwright
 
 ## Twilio
 
-- Inbound is real: `POST /api/webhooks/twilio` (+ `/status`) with hand-rolled HMAC-SHA1 signature validation (`src/lib/twilio-signature.ts`; skipped when `TWILIO_AUTH_TOKEN` is unset). Skips and processing errors return **200** so Twilio does not retry in a loop; errors go to the log. **An invalid signature returns 403 — never relax it to 200**, that would accept forged inbound messages.
-- **No outbound sending exists**: nothing calls the Twilio SDK; `appendOutboundMessage` only records to the DB. The signature is validated against `request.url`, which breaks behind a reverse proxy until `WEBHOOK_BASE_URL` is wired in (known pending item).
+- Inbound is real: `POST /api/webhooks/twilio` (+ `/status`). The signature is validated with the **Twilio SDK** (`twilio.validateRequest`) against the **public** URL (`WEBHOOK_BASE_URL` + path + query string), never against `request.url`: behind a proxy those are different URLs, and every legitimate delivery used to be rejected with 403.
+- **Validation is never skipped.** Without `TWILIO_AUTH_TOKEN` (or without `WEBHOOK_BASE_URL`) the webhook answers **503** and writes nothing; an invalid signature answers **403** and writes nothing. **Never relax either to 200** — that would accept forged inbound messages.
+- **The acceptance is ONE transaction**: `accept_inbound_whatsapp` (SECURITY DEFINER, advisory lock per client) creates the client if it does not exist, reuses — and reopens, same `conversation_id` — the thread of the channel (`conversations.channel`), and inserts the message ignoring a repeated `MessageSid`. Two simultaneous deliveries of the same message leave **one** message, **one** thread and **one** unread increment.
+- **The acknowledgement is empty TwiML** (`<?xml version="1.0" encoding="UTF-8"?><Response></Response>`), and it is only emitted once the reception is stored (or it was verified as already stored — a repeated `MessageSid` gets the same empty TwiML, Twilio must not retry an event already processed).
+- **A temporary storage failure answers 5xx, never 200**: a 200 would lose the message with nobody noticing. **Retry policy (pilot)**: by default Twilio retries only once and only on connection failures (`rc=1`, `rp=ct`), so a 5xx is only retried when the webhook URL in the Twilio console carries the connection overrides (`#rc=3&rp=5xx,ct,rt`) or they are set through the Webhooks configuration API. Those overrides live in the URL **fragment**, which is not part of the signature: the validation must ignore it.
+- **No outbound sending exists**: nothing calls the Twilio SDK to send; `appendOutboundMessage` only records to the DB.
 
 ## Conventions
 

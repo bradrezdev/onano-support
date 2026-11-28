@@ -6,6 +6,19 @@
 # alojado anterior. Este script lee las claves del stack vivo —no las lleva
 # escritas— y deja las variables en `apps/api/.env` y `apps/web/.env`.
 #
+# Variables de Twilio (webhook entrante): se COPIAN si están en el entorno y
+# nunca se inventan valores.
+#   · TWILIO_AUTH_TOKEN — la credencial con la que se valida la firma del
+#     webhook. Sin ella el webhook responde 503: la validación nunca se omite.
+#   · WEBHOOK_BASE_URL — el origen PÚBLICO del webhook (p. ej.
+#     http://localhost:3000). La firma se valida contra `WEBHOOK_BASE_URL` +
+#     ruta + query string, nunca contra `request.url`. Sin ella el webhook
+#     responde 503.
+# Para que sobrevivan a la regeneración del `.env`, expónlas antes de correr
+# el script:
+#   export TWILIO_AUTH_TOKEN=... WEBHOOK_BASE_URL=http://localhost:3000
+#   bash scripts/dev/local-env.sh
+#
 # El `.env` anterior (proyecto alojado) se conserva como `.env.legacy`: ese
 # proyecto es la fuente de recuperación del historial y se consulta a mano,
 # nunca se escribe.
@@ -47,6 +60,11 @@ SECRET_KEY="$(read_env SECRET_KEY)"
 PUBLISHABLE_KEY="$(read_env PUBLISHABLE_KEY)"
 DB_URL="$(read_env DB_URL)"
 
+# Las variables de Twilio SOLO se copian si el entorno las trae: el script
+# nunca inventa una credencial. Sin ellas el webhook entrante responde 503.
+TWILIO_AUTH_TOKEN="${TWILIO_AUTH_TOKEN:-}"
+WEBHOOK_BASE_URL="${WEBHOOK_BASE_URL:-}"
+
 if [ -z "${API_URL}" ] || [ -z "${SECRET_KEY}" ] || [ -z "${PUBLISHABLE_KEY}" ] || [ -z "${DB_URL}" ]; then
   echo "El stack local no publicó todas las claves. ¿Está corriendo 'supabase start'?" >&2
   exit 1
@@ -69,6 +87,8 @@ NEXT_PUBLIC_SUPABASE_URL=${API_URL}
 NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=${PUBLISHABLE_KEY}
 DATABASE_URL=${DB_URL}
 CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
+${TWILIO_AUTH_TOKEN:+TWILIO_AUTH_TOKEN=${TWILIO_AUTH_TOKEN}}
+${WEBHOOK_BASE_URL:+WEBHOOK_BASE_URL=${WEBHOOK_BASE_URL}}
 EOF
 
 cat > "${REPO_ROOT}/apps/web/.env" <<EOF
