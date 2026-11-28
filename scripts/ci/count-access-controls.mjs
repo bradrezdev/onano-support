@@ -15,7 +15,7 @@
 import { readFileSync } from 'node:fs'
 
 const file = process.argv[2]
-const MINIMUM = Number(process.argv[3] ?? 20)
+const MINIMUM = Number(process.argv[3] ?? 32)
 const SUITE = 'integration/conversation-authorization.test.ts'
 
 if (!file) {

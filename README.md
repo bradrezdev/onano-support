@@ -375,7 +375,9 @@ Mientras el veredicto diga que el entorno no puede recibir datos reales, **el en
 
 - Escribir en un chat y transferirlo son operaciones **transaccionales** en la base (`append_outbound_message`, `reassign_conversation`, `take_conversation`): la validación del titular y el guardado ocurren en la misma operación, así que un chat que cambió de manos mientras el agente redactaba **no guarda nada** y la interfaz lo informa (`409 assignment_changed`).
 - Transferir exige **motivo** y **versión vigente** (`{ assigned_agent_id, reason, expected_version }`); una versión obsoleta se rechaza con `409 version_conflict`. El cambio y su bitácora (`conversation_audit_log`) se escriben en la misma transacción.
-- Los adjuntos se autorizan por pertenencia (titular del ticket, titular del chat del mensaje, o admin/supervisor) y el archivo se sirve por **URL firmada**; el bucket es privado y ya no tiene políticas para `authenticated`.
+- Los adjuntos se autorizan **por adjunto**: titular del ticket, titular del chat del mensaje, o admin/supervisor. Un ticket con evidencia de dos chats muestra toda al titular del ticket y solo la de su chat al agente que atiende ese chat.
+- El archivo lo sirve la **API** (bytes, con `?download=1` para descargar): no hay URL firmada, porque sobrevivía a la pérdida de permiso. El bucket es privado y ya no tiene políticas para `authenticated`.
+- **Desvincular no borra el objeto**: el borrado físico es una operación aparte (`POST /api/tickets/:id/attachments/:messageId/purge`) que exige admin/supervisor, que no quede ninguna referencia viva y que se haya pasado la ventana de conservación (`RETENTION_DAYS`), y deja bitácora en `attachment_purge_log`.
 
 ### Base de datos
 

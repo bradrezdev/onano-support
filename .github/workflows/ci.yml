@@ -260,7 +260,7 @@ jobs:
 
       # A control that did not run is a pending control: the job fails.
       - name: Count access controls
-        run: node scripts/ci/count-access-controls.mjs /tmp/integration-results.json 20
+        run: node scripts/ci/count-access-controls.mjs /tmp/integration-results.json 32
 
       - name: E2E (Playwright, autenticado)
         env:
