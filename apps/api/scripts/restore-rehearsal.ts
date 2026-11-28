@@ -663,7 +663,7 @@ async function main() {
     fail('verificación', 'la copia devolvió un keyring vacío: los permisos no se restauraron')
   }
 
-  // 8.2 · relación cuenta↔chat y contacto
+  // 8.2 · relación cuenta↔chat y cliente
   const { data: chatRow, error: chatErr } = await rest
     .from('conversations')
     .select('id, contact_id, assigned_agent_id')
@@ -676,7 +676,7 @@ async function main() {
     fail('verificación', 'el chat no está asignado a la cuenta restaurada')
   }
   if (chatRow.contact_id !== manifest.contact.id) {
-    fail('verificación', 'el chat no apunta al contacto restaurado')
+    fail('verificación', 'el chat no apunta al cliente restaurado')
   }
 
   // 8.3 · historial del chat, servido y autorizado por la app
@@ -735,7 +735,7 @@ async function main() {
       'volcado aplicado y conteos por tabla',
       'inicio de sesión',
       'keyring de permisos',
-      'relación cuenta-chat-contacto',
+      'relación cuenta-chat-cliente',
       'historial del chat',
       'contenido del archivo',
     ],

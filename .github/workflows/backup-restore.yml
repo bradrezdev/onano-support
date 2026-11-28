@@ -74,6 +74,7 @@ jobs:
           ORIGIN_STACK_DIR: ${{ runner.temp }}/sb-origin
           # El contenedor del origen en CI se llama distinto al de la maquina:
           # el project_id de supabase/ci/config.toml es "onano-support-ci".
+          ORIGIN_PROJECT: onano-support-ci
           ORIGIN_DB_CONTAINER: supabase_db_onano-support-ci
         run: |
           set -euo pipefail
@@ -89,18 +90,44 @@ jobs:
       # 3 · Detener el origen para demostrar que la restauración no lo necesita.
       # ------------------------------------------------------------------
       - name: Stop origin containers
+        env:
+          ORIGIN_PROJECT: onano-support-ci
+          ORIGIN_DB_CONTAINER: supabase_db_onano-support-ci
         run: |
           set -euo pipefail
           ORIGIN_CONTAINERS=(
-            "supabase_db_onano-support-ci"
-            "supabase_rest_onano-support-ci"
-            "supabase_auth_onano-support-ci"
-            "supabase_kong_onano-support-ci"
-            "supabase_storage_onano-support-ci"
+            "${ORIGIN_DB_CONTAINER}"
+            "supabase_rest_${ORIGIN_PROJECT}"
+            "supabase_auth_${ORIGIN_PROJECT}"
+            "supabase_kong_${ORIGIN_PROJECT}"
+            "supabase_storage_${ORIGIN_PROJECT}"
           )
+          # La URL del origen se resuelve del entorno (en CI no hay
+          # apps/api/.env: la instancia efímera publica sus variables).
+          ORIGIN_API="${SUPABASE_URL:-}"
+          if [ -z "${ORIGIN_API}" ] && [ -f apps/api/.env ]; then
+            ORIGIN_API="$(grep -E '^SUPABASE_URL=' apps/api/.env | head -n 1 | cut -d= -f2- | tr -d '"')"
+          fi
+          if [ -z "${ORIGIN_API}" ]; then
+            echo "::error::No se pudo resolver la URL del origen (SUPABASE_URL)"
+            exit 1
+          fi
+          # Comprobación previa: el origen tiene que CONTESTAR antes de
+          # detenerlo. Si la URL estuviera mal, el curl posterior fallaría
+          # por la URL y no porque el origen estuviera apagado.
+          if ! curl -s -o /dev/null --max-time 5 "${ORIGIN_API}/auth/v1/health"; then
+            echo "::error::El origen no responde en ${ORIGIN_API} antes de detenerlo"
+            exit 1
+          fi
+          echo "Origen accesible en ${ORIGIN_API} (comprobación previa)."
           docker stop "${ORIGIN_CONTAINERS[@]}" > /dev/null 2>&1 || true
           sleep 2
-          RUNNING="$(docker ps --format '{{.Names}}' | grep -E '^supabase_(db|rest|auth|kong|storage)_onano-support-ci$' || true)"
+          RUNNING=""
+          for c in "${ORIGIN_CONTAINERS[@]}"; do
+            if docker ps --format '{{.Names}}' | grep -qx "${c}"; then
+              RUNNING="${RUNNING}${c} "
+            fi
+          done
           if [ -n "${RUNNING}" ]; then
             echo "::error::No se pudo detener el origen: ${RUNNING}"
             exit 1
@@ -109,21 +136,11 @@ jobs:
           # tener los contenedores parados. Si el nombre de un contenedor
           # cambiara, el grep de arriba no lo vería y la demostración sería
           # falsa; el curl no depende de nombres.
-          ORIGIN_API="${SUPABASE_URL:-}"
-          if [ -z "${ORIGIN_API}" ] && [ -f apps/api/.env ]; then
-            ORIGIN_API="$(grep -E '^SUPABASE_URL=' apps/api/.env | head -n 1 | cut -d= -f2- | tr -d '"')"
-          fi
-          if [ -n "${ORIGIN_API}" ]; then
-            if curl -s -o /dev/null --max-time 5 "${ORIGIN_API}/auth/v1/health"; then
-              echo "::error::El origen sigue respondiendo en ${ORIGIN_API}: la demostración no probaría nada"
-              exit 1
-            fi
-            echo "Origen inaccesible en ${ORIGIN_API} (verificado por curl)."
-          else
-            echo "::error::No se pudo resolver la URL del origen (SUPABASE_URL)"
+          if curl -s -o /dev/null --max-time 5 "${ORIGIN_API}/auth/v1/health"; then
+            echo "::error::El origen sigue respondiendo en ${ORIGIN_API}: la demostración no probaría nada"
             exit 1
           fi
-          echo "Origen desconectado."
+          echo "Origen inaccesible en ${ORIGIN_API} (verificado por curl)."
 
       # ------------------------------------------------------------------
       # 4 · Restaurar en una segunda instancia con puertos remapeados.
@@ -146,16 +163,31 @@ jobs:
       # ------------------------------------------------------------------
       - name: Restart origin containers
         if: always()
+        env:
+          ORIGIN_PROJECT: onano-support-ci
+          ORIGIN_DB_CONTAINER: supabase_db_onano-support-ci
         run: |
           set -euo pipefail
           ORIGIN_CONTAINERS=(
-            "supabase_db_onano-support-ci"
-            "supabase_rest_onano-support-ci"
-            "supabase_auth_onano-support-ci"
-            "supabase_kong_onano-support-ci"
-            "supabase_storage_onano-support-ci"
+            "${ORIGIN_DB_CONTAINER}"
+            "supabase_rest_${ORIGIN_PROJECT}"
+            "supabase_auth_${ORIGIN_PROJECT}"
+            "supabase_kong_${ORIGIN_PROJECT}"
+            "supabase_storage_${ORIGIN_PROJECT}"
           )
           docker start "${ORIGIN_CONTAINERS[@]}" > /dev/null 2>&1 || true
+          sleep 2
+          PENDIENTES=""
+          for c in "${ORIGIN_CONTAINERS[@]}"; do
+            if ! docker ps --format '{{.Names}}' | grep -qx "${c}"; then
+              PENDIENTES="${PENDIENTES}${c} "
+            fi
+          done
+          if [ -n "${PENDIENTES}" ]; then
+            echo "::error::El origen no volvió a levantar: ${PENDIENTES}"
+            exit 1
+          fi
+          echo "Origen reanudado."
 
       - name: Print registry record
         if: always()
