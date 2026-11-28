@@ -1,38 +1,32 @@
 /**
- * Ensayo de respaldo y restauración (PR #1, corrección del respaldo).
+ * Ensayo de restauración desde disco (PR #1).
  *
- * Antes este ensayo declaraba ÉXITO aunque la restauración fallara: los
- * avisos de `pg_restore` se ignoraban y los conteos se comparaban después,
- * sin comprobar que el error hubiera dejado la copia vacía. Ahora es
- * estricto: si la restauración falla, o si falta una muestra (cuenta, chat o
- * archivo), el ensayo **falla**.
+ * Recibe un directorio de respaldo (--backup <dir>) y restaura su contenido
+ * en la instancia de restauración SIN conectarse al origen. El ensayo
+ * demuestra que el respaldo es autocontenido: el origen puede estar apagado.
  *
- * Qué hace, en orden:
- *   1 · Prepara una MUESTRA SINTÉTICA en la instancia de desarrollo: una
- *       cuenta, un chat con mensajes y un archivo con contenido real.
- *   2 · Escribe el respaldo: el volcado del esquema (referencia) y el
- *       manifiesto con la muestra (credenciales y contenido del archivo).
- *   3 · Levanta (o reutiliza) OTRA INSTANCIA DE SUPABASE y la deja en estado
- *       limpio: el esquema `public` se recrea y se le devuelven los
- *       privilegios por defecto de Supabase. El esquema se restaura desde la
- *       FUENTE DE VERDAD, que son los archivos versionados del repo, no el
- *       ledger de la base.
- *   4 · Aplica las migraciones del repo en esa instancia.
- *   5 · Restaura la muestra: la cuenta, el chat con sus mensajes y el archivo.
- *   6 · Verifica en la instancia restaurada: inicio de sesión, permisos
- *       (keyring), historial del chat y contenido del archivo.
- *   7 · Registra FUERA de la base: destino, actor, fecha, commit y el
- *       resultado de las migraciones.
+ * Pasos:
+ *   1 · Verifica la integridad del respaldo (archivos presentes y hashes).
+ *   2 · Limpia y recrea el esquema `public` en la instancia de restauración.
+ *   3 · Aplica las migraciones del repo en la instancia de restauración.
+ *   4 · Crea la cuenta de la muestra en el destino con la contraseña del
+ *       manifiesto (los hashes de contraseña no migran entre instancias).
+ *   5 · Restaura las filas de la muestra desde el manifiesto.
+ *   6 · Restaura los objetos del bucket `whatsapp-media` desde disco.
+ *   7 · Verifica identidad, permisos, relación cuenta↔chat, historial y bytes
+ *       del adjunto usando los route handlers reales en proceso.
+ *   8 · Registra el resultado fuera de la base.
  *
- *   cd apps/api && pnpm tsx scripts/restore-rehearsal.ts
+ *   cd apps/api && pnpm exec tsx scripts/restore-rehearsal.ts --backup <dir>
  */
 import 'dotenv/config'
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, readFileSync, writeFileSync, appendFileSync, existsSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, appendFileSync, existsSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
-import { homedir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { Client } from 'pg'
 import { createClient } from '@supabase/supabase-js'
+import { verifyBackupIntegrity, type BackupManifest } from '../src/lib/backup-integrity'
 
 const REPO = process.cwd().endsWith('apps/api') ? process.cwd() : join(process.cwd(), 'apps/api')
 const REPO_ROOT = join(REPO, '..', '..')
@@ -40,15 +34,6 @@ const RESTORE_STACK_DIR =
   process.env.RESTORE_STACK_DIR ?? join(homedir(), 'supabase-dev/onano-support-restore')
 const BACKUP_DIR = process.env.BACKUP_DIR ?? join(homedir(), 'supabase-dev/backups')
 const REGISTRY = join(BACKUP_DIR, 'registry.jsonl')
-
-const DEV_API = process.env.SUPABASE_URL ?? 'http://127.0.0.1:54321'
-const DEV_KEY = process.env.SUPABASE_SECRET_KEY ?? ''
-const DEV_DB = process.env.DATABASE_URL ?? ''
-const SAMPLE_EMAIL = 'e2e.rehearsal@example.test'
-const SAMPLE_PASSWORD = 'E2E-rehearsal-9931'
-const SAMPLE_BODY = 'Mensaje de muestra para el ensayo de respaldo.'
-const SAMPLE_FILE_NAME = 'e2e-rehearsal.txt'
-const SAMPLE_FILE_CONTENT = 'Contenido de muestra del ensayo de respaldo.\nsegunda línea\n'
 
 function sh(cmd: string, args: string[], opts: { cwd?: string; quiet?: boolean } = {}): string {
   const out = execFileSync(cmd, args, {
@@ -63,7 +48,7 @@ function sh(cmd: string, args: string[], opts: { cwd?: string; quiet?: boolean }
 
 function gitCommit(): string {
   try {
-    return sh('git', ['rev-parse', 'HEAD'], { quiet: true }).trim()
+    return sh('git', ['rev-parse', 'HEAD'], { cwd: REPO_ROOT, quiet: true }).trim()
   } catch {
     return 'desconocido'
   }
@@ -72,7 +57,7 @@ function gitCommit(): string {
 function actor(): string {
   try {
     return (
-      sh('git', ['config', 'user.email'], { quiet: true }).trim() ||
+      sh('git', ['config', 'user.email'], { cwd: REPO_ROOT, quiet: true }).trim() ||
       process.env.USER ||
       'desconocido'
     )
@@ -81,7 +66,6 @@ function actor(): string {
   }
 }
 
-/** Registro fuera de la base: destino, actor, fecha, commit y migraciones. */
 function register(entry: Record<string, unknown>) {
   mkdirSync(BACKUP_DIR, { recursive: true })
   appendFileSync(REGISTRY, JSON.stringify(entry) + '\n')
@@ -103,7 +87,6 @@ function fail(step: string, detail: string): never {
   process.exit(1)
 }
 
-/** Consulta directa: el ledger y los privilegios no se leen por REST. */
 async function sql<T = unknown>(connectionString: string, text: string): Promise<T[]> {
   const host = (() => {
     try {
@@ -134,13 +117,6 @@ const q = (v: unknown): string => {
   return `'${String(v).replace(/'/g, "''")}'`
 }
 
-/**
- * Verificación a nivel de aplicación: se invocan los route handlers REALES
- * (los mismos que sirven el tráfico HTTP) en proceso, con un JWT de la
- * copia. Así se comprueba la cadena completa — autenticación, permisos y
- * autorización del historial — sin depender de un puerto libre ni de un
- * servidor de desarrollo levantado.
- */
 async function callRoute<TContext>(
   handler: (request: Request, ctx: TContext) => Promise<Response>,
   path: string,
@@ -161,140 +137,38 @@ async function callRoute<TContext>(
   return { status: res.status, body }
 }
 
+function parseArgs(): { backupDir: string } {
+  const args = process.argv.slice(2)
+  const idx = args.indexOf('--backup')
+  if (idx === -1 || !args[idx + 1]) {
+    console.error('Uso: pnpm exec tsx scripts/restore-rehearsal.ts --backup <directorio>')
+    process.exit(2)
+  }
+  return { backupDir: args[idx + 1] }
+}
+
 async function main() {
-  if (!DEV_KEY || !DEV_DB) {
-    fail('preparación', 'faltan SUPABASE_SECRET_KEY o DATABASE_URL del entorno de desarrollo')
-  }
+  const { backupDir } = parseArgs()
+  if (!existsSync(backupDir)) fail('argumentos', `no existe el directorio de respaldo: ${backupDir}`)
+  const manifestPath = join(backupDir, 'manifest.json')
+  if (!existsSync(manifestPath)) fail('argumentos', `no existe el manifiesto: ${manifestPath}`)
+
+  const manifest: BackupManifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
   mkdirSync(BACKUP_DIR, { recursive: true })
-  const dev = createClient(DEV_API, DEV_KEY, { auth: { persistSession: false } })
 
-  // ---------------------------------------------------------------- 1 · muestra
-  console.log('== 1 · muestra sintética en la instancia de desarrollo ==')
-  const { data: listed } = await dev.auth.admin.listUsers({ page: 1, perPage: 200 })
-  const existing = listed?.users.find((u) => u.email?.toLowerCase() === SAMPLE_EMAIL)
-  if (existing) await dev.auth.admin.deleteUser(existing.id)
-  const { data: created, error: createErr } = await dev.auth.admin.createUser({
-    email: SAMPLE_EMAIL,
-    password: SAMPLE_PASSWORD,
-    email_confirm: true,
-    user_metadata: { display_name: 'E2E Muestra' },
-  })
-  if (createErr) fail('preparación', `no se pudo crear la cuenta de muestra: ${createErr.message}`)
-  const sampleUserId = created.user.id
-  await dev
-    .from('profiles')
-    .update({ display_name: 'E2E Muestra', role_key: 'soporte', role: 'soporte' })
-    .eq('id', sampleUserId)
+  // ---------------------------------------------------------------- 1 · integridad
+  console.log('== 1 · integridad del respaldo ==')
+  const integrity = verifyBackupIntegrity(backupDir, manifest)
+  if (!integrity.ok) fail('integridad', integrity.error)
+  console.log('   archivos presentes y hashes correctos')
 
-  const { data: contact } = await dev
-    .from('contacts')
-    .select('id, whatsapp_number, name, country')
-    .eq('whatsapp_number', '+525550000001')
-    .maybeSingle<{ id: string; whatsapp_number: string; name: string | null; country: string | null }>()
-  if (!contact) fail('preparación', 'no hay cliente sintético: corre la semilla')
-
-  const { data: chat, error: chatErr } = await dev
-    .from('conversations')
-    .insert({
-      contact_id: contact.id,
-      assigned_agent_id: sampleUserId,
-      status: 'open',
-      last_message_at: new Date().toISOString(),
-      last_message_preview: SAMPLE_BODY,
-      unread_count: 0,
-    })
-    .select('id')
-    .single<{ id: string }>()
-  if (chatErr) fail('preparación', `no se pudo crear el chat de muestra: ${chatErr.message}`)
-  const { error: msgErr } = await dev.from('messages').insert({
-    conversation_id: chat.id,
-    direction: 'in',
-    body: SAMPLE_BODY,
-  })
-  if (msgErr) fail('preparación', `no se pudo crear el mensaje de muestra: ${msgErr.message}`)
-
-  const { data: buckets } = await dev.storage.listBuckets()
-  if (!buckets?.some((b) => b.name === 'whatsapp-media')) {
-    fail('preparación', 'no existe el bucket whatsapp-media en el entorno de desarrollo')
-  }
-  const filePath = `muestra/${SAMPLE_FILE_NAME}`
-  const { error: upErr } = await dev.storage
-    .from('whatsapp-media')
-    .upload(filePath, SAMPLE_FILE_CONTENT, { contentType: 'text/plain', upsert: true })
-  if (upErr) fail('preparación', `no se pudo subir el archivo de muestra: ${upErr.message}`)
-  const { data: downloaded, error: downErr } = await dev.storage
-    .from('whatsapp-media')
-    .download(filePath)
-  if (downErr || !downloaded) {
-    fail('preparación', `no se pudo leer el archivo de muestra: ${downErr?.message ?? 'sin datos'}`)
-  }
-  const fileBytes = Buffer.from(await downloaded.arrayBuffer())
-  console.log(`   cuenta=${SAMPLE_EMAIL} chat=${chat.id} archivo=${filePath} (${fileBytes.length} bytes)`)
-
-  // ---------------------------------------------------------------- 2 · respaldo
-  console.log('== 2 · respaldo (volcado de referencia + manifiesto) ==')
-  const stamp = new Date().toISOString().replace(/[-:]/g, '').slice(0, 15)
-  const dumpPath = join(BACKUP_DIR, `dev-public-${stamp}.sql`)
-  const devContainer = process.env.DEV_DB_CONTAINER ?? 'supabase_db_onano-support-dev'
-  try {
-    // El pg_dump del propio contenedor: su versión coincide con la del
-    // Postgres que lo hospeda y con la de la instancia de restauración.
-    sh(
-      'docker',
-      [
-        'exec',
-        devContainer,
-        'pg_dump',
-        '-U',
-        'postgres',
-        '-d',
-        'postgres',
-        '--format=plain',
-        '--schema=public',
-        '--file=/tmp/dev-public.sql',
-      ],
-      { quiet: true },
-    )
-    sh('docker', ['cp', `${devContainer}:/tmp/dev-public.sql`, dumpPath], { quiet: true })
-    sh('docker', ['exec', devContainer, 'rm', '-f', '/tmp/dev-public.sql'], { quiet: true })
-  } catch (e) {
-    fail('volcado', `pg_dump falló: ${(e as Error).message}`)
-  }
-  if (!existsSync(dumpPath)) fail('volcado', `no se creó el volcado ${dumpPath}`)
-
-  const devLedger = await sql<{ filename: string; applied_at: string }>(
-    DEV_DB,
-    `select filename, applied_at from public.schema_migrations order by filename`,
-  )
-  const manifest = {
-    cuenta: { email: SAMPLE_EMAIL, password: SAMPLE_PASSWORD },
-    cliente: {
-      id: contact.id,
-      whatsapp_number: contact.whatsapp_number,
-      name: contact.name,
-      country: contact.country,
-    },
-    chat: { id: chat.id, body: SAMPLE_BODY },
-    archivo: { path: filePath, bytes: fileBytes.toString('base64') },
-    migraciones: devLedger.map((l) => ({ filename: l.filename, applied_at: l.applied_at })),
-    commit: gitCommit(),
-    fecha: new Date().toISOString(),
-  }
-  const manifestPath = join(BACKUP_DIR, `dev-manifest-${stamp}.json`)
-  writeFileSync(manifestPath, JSON.stringify(manifest, null, 2))
-  console.log(`   volcado=${dumpPath}`)
-  console.log(`   manifiesto=${manifestPath}`)
-
-  // ---------------------------------------------------------------- 3 · otra instancia
-  console.log('== 3 · otra instancia de Supabase (la de restauración) ==')
+  // ---------------------------------------------------------------- 2 · instancia de restauración
+  console.log('== 2 · instancia de restauración ==')
   const restoreEnv = prepareRestoreStack()
   console.log(`   API=${restoreEnv.apiUrl} DB=${restoreEnv.dbUrl}`)
 
-  // 3.1 · estado limpio: el esquema `public` se recrea y se le devuelven
-  // los privilegios por defecto de Supabase. Sin esto, una instancia cuyo
-  // esquema se recreó queda sin USAGE para `service_role` y la API responde
-  // «permission denied for schema public».
-  console.log('== 3.1 · estado limpio de la instancia de restauración ==')
+  // ---------------------------------------------------------------- 3 · estado limpio
+  console.log('== 3 · estado limpio del destino ==')
   try {
     await sql(restoreEnv.dbUrl, 'drop schema public cascade; create schema public;')
   } catch (e) {
@@ -349,36 +223,38 @@ async function main() {
   }
   console.log(`   migraciones aplicadas: ${restoredLedger.length}`)
 
-  // ---------------------------------------------------------------- 5 · restaurar
+  // ---------------------------------------------------------------- 5 · restaurar muestra
   console.log('== 5 · restauración de la muestra ==')
   const rest = createClient(restoreEnv.apiUrl, restoreEnv.secretKey, {
     auth: { persistSession: false },
   })
-  // La cuenta de muestra puede existir de una corrida anterior: se borra
-  // para que el ensayo sea repetible.
+
+  // La cuenta puede existir de una corrida anterior: se borra para repetibilidad.
   const { data: copyUsers } = await rest.auth.admin.listUsers({ page: 1, perPage: 200 })
-  const previous = copyUsers?.users.find((u) => u.email?.toLowerCase() === SAMPLE_EMAIL)
+  const previous = copyUsers?.users.find((u) => u.email?.toLowerCase() === manifest.account.email)
   if (previous) await rest.auth.admin.deleteUser(previous.id)
-  const { data: createdUser, error: createErr2 } = await rest.auth.admin.createUser({
-    email: SAMPLE_EMAIL,
-    password: SAMPLE_PASSWORD,
+
+  const { data: createdUser, error: createErr } = await rest.auth.admin.createUser({
+    email: manifest.account.email,
+    password: manifest.account.password,
     email_confirm: true,
-    user_metadata: { display_name: 'E2E Muestra' },
+    user_metadata: { display_name: 'Backup Muestra' },
   })
-  if (createErr2) fail('restauración', `no se pudo crear la cuenta en la copia: ${createErr2.message}`)
+  if (createErr) fail('restauración', `no se pudo crear la cuenta en la copia: ${createErr.message}`)
   const copyUserId = createdUser.user.id
 
-  // El paquete de muestra se escribe aquí: el identificador de la cuenta en
-  // la copia es el de la copia (las claves foráneas apuntan a `auth.users`).
-  const sampleSqlPath = join(BACKUP_DIR, `dev-sample-${stamp}.sql`)
+  // El SQL de la muestra se escribe FUERA del respaldo: el directorio del
+  // respaldo es la fuente y no se toca (su integridad está verificada).
+  const workDir = mkdtempSync(join(tmpdir(), 'crm-restore-'))
+  const sampleSqlPath = join(workDir, 'restore-sample.sql')
   writeFileSync(
     sampleSqlPath,
     [
-      '-- Muestra del ensayo de respaldo (cliente + cuenta + chat + mensaje).',
-      `insert into public.contacts (id, whatsapp_number, name, country) values (${q(contact.id)}, ${q(contact.whatsapp_number)}, ${q(contact.name)}, ${q(contact.country)}) on conflict (id) do nothing;`,
-      `insert into public.profiles (id, display_name, role, role_key) values (${q(copyUserId)}, 'E2E Muestra', 'soporte', 'soporte') on conflict (id) do nothing;`,
-      `insert into public.conversations (id, contact_id, assigned_agent_id, status, last_message_at, last_message_preview, unread_count) values (${q(chat.id)}, ${q(contact.id)}, ${q(copyUserId)}, 'open', now(), ${q(SAMPLE_BODY)}, 0) on conflict (id) do nothing;`,
-      `insert into public.messages (conversation_id, direction, body) values (${q(chat.id)}, 'in', ${q(SAMPLE_BODY)});`,
+      '-- Muestra restaurada desde el manifiesto del respaldo.',
+      `insert into public.contacts (id, whatsapp_number, name, country) values (${q(manifest.contact.id)}, ${q(manifest.contact.whatsapp_number)}, ${q(manifest.contact.name)}, ${q(manifest.contact.country)}) on conflict (id) do nothing;`,
+      `insert into public.profiles (id, display_name, role, role_key) values (${q(copyUserId)}, 'Backup Muestra', 'soporte', 'soporte') on conflict (id) do nothing;`,
+      `insert into public.conversations (id, contact_id, assigned_agent_id, status, last_message_at, last_message_preview, unread_count) values (${q(manifest.conversation.id)}, ${q(manifest.contact.id)}, ${q(copyUserId)}, 'open', now(), ${q(manifest.conversation.body)}, 0) on conflict (id) do nothing;`,
+      `insert into public.messages (conversation_id, direction, body) values (${q(manifest.conversation.id)}, 'in', ${q(manifest.conversation.body)});`,
       '',
     ].join('\n'),
   )
@@ -411,83 +287,121 @@ async function main() {
     fail('restauración', `la muestra no se restauró: ${out.slice(-800)}`)
   }
 
-  // El archivo también es parte del respaldo: se sube a la copia.
-  const { error: upErr2 } = await rest.storage
-    .from('whatsapp-media')
-    .upload(filePath, fileBytes, { contentType: 'text/plain', upsert: true })
-  if (upErr2) fail('restauración', `no se pudo subir el archivo a la copia: ${upErr2.message}`)
+  // ---------------------------------------------------------------- 6 · objetos de Storage
+  console.log('== 6 · objetos de Storage desde disco ==')
+  const storageDir = join(backupDir, 'storage')
+  if (existsSync(storageDir)) {
+    const { readdirSync, statSync } = await import('node:fs')
+    const walk = (dir: string): string[] => {
+      const out: string[] = []
+      for (const entry of readdirSync(dir)) {
+        const full = join(dir, entry)
+        if (statSync(full).isDirectory()) {
+          out.push(...walk(full))
+        } else {
+          out.push(full)
+        }
+      }
+      return out
+    }
+    const files = walk(storageDir)
+    for (const fullPath of files) {
+      const objectName = fullPath.slice(storageDir.length + 1)
+      const bytes = readFileSync(fullPath)
+      const { error: upErr } = await rest.storage
+        .from('whatsapp-media')
+        .upload(objectName, bytes, { contentType: 'text/plain', upsert: true })
+      if (upErr) fail('storage', `no se pudo subir ${objectName}: ${upErr.message}`)
+      console.log(`   ${objectName} (${bytes.length} bytes)`)
+    }
+    if (files.length === 0) console.log('   (sin objetos)')
+  }
 
-  // ---------------------------------------------------------------- 6 · verificar
-  console.log('== 6 · verificación en la instancia restaurada ==')
+  // ---------------------------------------------------------------- 7 · verificación
+  console.log('== 7 · verificación en la instancia restaurada ==')
   const browser = createClient(restoreEnv.apiUrl, restoreEnv.publishableKey, {
     auth: { persistSession: false },
   })
   const { data: session, error: signInErr } = await browser.auth.signInWithPassword({
-    email: SAMPLE_EMAIL,
-    password: SAMPLE_PASSWORD,
+    email: manifest.account.email,
+    password: manifest.account.password,
   })
   if (signInErr) fail('verificación', `el inicio de sesión falló en la copia: ${signInErr.message}`)
   const token = session.session?.access_token
   if (!token) fail('verificación', 'la copia no devolvió token de sesión')
 
-  // La app se apunta a la copia: la app es la que resuelve permisos e
-  // historial, no la API de Supabase.
   process.env.SUPABASE_URL = restoreEnv.apiUrl
   process.env.SUPABASE_SECRET_KEY = restoreEnv.secretKey
   process.env.NEXT_PUBLIC_SUPABASE_URL = restoreEnv.apiUrl
   process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY = restoreEnv.publishableKey
   process.env.DATABASE_URL = restoreEnv.dbUrl
 
-  let permissions: string[] = []
-  let historyCount = 0
-
-  // Los route handlers reales, en proceso.
   const meRoute = await import('../src/app/api/me/route')
   const conversationRoute = await import('../src/app/api/conversations/[id]/route')
 
-  // 6.1 · permisos: el keyring que resuelve la app en la copia
+  // 7.1 · identidad + permisos
   const me = await callRoute<undefined>(meRoute.GET, '/api/me', token, undefined)
   if (me.status !== 200) {
     fail('verificación', `/api/me respondió ${me.status} en la copia`)
   }
-  permissions = me.body?.data?.permissions ?? []
+  const permissions = me.body?.data?.permissions ?? []
   if (!Array.isArray(permissions) || permissions.length === 0) {
     fail('verificación', 'la copia devolvió un keyring vacío: los permisos no se restauraron')
   }
 
-  // 6.2 · historial del chat, servido y autorizado por la app
+  // 7.2 · relación cuenta↔chat y contacto
+  const { data: chatRow, error: chatErr } = await rest
+    .from('conversations')
+    .select('id, contact_id, assigned_agent_id')
+    .eq('id', manifest.conversation.id)
+    .maybeSingle<{ id: string; contact_id: string; assigned_agent_id: string | null }>()
+  if (chatErr || !chatRow) {
+    fail('verificación', `no se encontró el chat restaurado: ${chatErr?.message ?? 'sin datos'}`)
+  }
+  if (chatRow.assigned_agent_id !== copyUserId) {
+    fail('verificación', 'el chat no está asignado a la cuenta restaurada')
+  }
+  if (chatRow.contact_id !== manifest.contact.id) {
+    fail('verificación', 'el chat no apunta al contacto restaurado')
+  }
+
+  // 7.3 · historial del chat, servido y autorizado por la app
   const history = await callRoute(
     conversationRoute.GET,
-    `/api/conversations/${chat.id}`,
+    `/api/conversations/${manifest.conversation.id}`,
     token,
-    { params: Promise.resolve({ id: chat.id }) },
+    { params: Promise.resolve({ id: manifest.conversation.id }) },
   )
   if (history.status !== 200) {
     fail('verificación', `el historial respondió ${history.status} en la copia`)
   }
   const historyItems = history.body?.data?.messages ?? []
-  historyCount = Array.isArray(historyItems) ? historyItems.length : 0
-  if (!JSON.stringify(historyItems).includes(SAMPLE_BODY)) {
+  const historyCount = Array.isArray(historyItems) ? historyItems.length : 0
+  if (!JSON.stringify(historyItems).includes(manifest.conversation.body)) {
     fail('verificación', 'el historial del chat no se restauró')
   }
 
-  // 6.3 · archivo: contenido idéntico al de la muestra
-  const { data: back, error: backErr } = await rest.storage
-    .from('whatsapp-media')
-    .download(filePath)
+  // 7.4 · bytes del adjunto de la muestra
+  const sampleFileEntry = manifest.files.find((f) => f.path === `storage/${manifest.attachment.path}`)
+  if (!sampleFileEntry) {
+    fail('verificación', `el manifiesto no incluye el adjunto de la muestra: ${manifest.attachment.path}`)
+  }
+  const objectName = sampleFileEntry.path.slice('storage/'.length)
+  const backupBytes = readFileSync(join(backupDir, sampleFileEntry.path))
+  const { data: back, error: backErr } = await rest.storage.from('whatsapp-media').download(objectName)
   if (backErr || !back) {
     fail('verificación', `no se pudo leer el archivo en la copia: ${backErr?.message ?? 'sin datos'}`)
   }
   const backBytes = Buffer.from(await back.arrayBuffer())
-  if (!backBytes.equals(fileBytes)) {
+  if (!backBytes.equals(backupBytes)) {
     fail(
       'verificación',
-      `el contenido del archivo difiere (${backBytes.length} vs ${fileBytes.length} bytes)`,
+      `el contenido del archivo difiere (${backBytes.length} vs ${backupBytes.length} bytes)`,
     )
   }
 
-  // ---------------------------------------------------------------- 7 · registro
-  register({
+  // ---------------------------------------------------------------- 8 · registro
+  const record = {
     objetivo: 'ensayo de respaldo y restauración',
     destino: restoreEnv.apiUrl,
     actor: actor(),
@@ -495,29 +409,37 @@ async function main() {
     commit: gitCommit(),
     resultado: 'OK',
     muestra: {
-      cuenta: SAMPLE_EMAIL,
-      chat: chat.id,
-      archivo: filePath,
-      bytes: fileBytes.length,
+      cuenta: manifest.account.email,
+      chat: manifest.conversation.id,
+      archivo: sampleFileEntry.path,
+      bytes: sampleFileEntry.size,
     },
     verificado: [
       'inicio de sesión',
       'keyring de permisos',
+      'relación cuenta-chat-contacto',
       'historial del chat',
       'contenido del archivo',
     ],
     migraciones: restoredLedger.map((l) => ({ filename: l.filename, applied_at: l.applied_at })),
-    volcado: dumpPath,
-    muestra_sql: sampleSqlPath,
-    manifiesto: manifestPath,
-  })
+    backup_dir: backupDir,
+    hashes: manifest.files.reduce<Record<string, string>>((acc, f) => {
+      acc[f.path] = f.sha256
+      return acc
+    }, {}),
+  }
+  register(record)
 
   console.log('')
   console.log('== OK · el respaldo se restauró y se verificó en otra instancia ==')
   console.log(
-    `   cuenta=${SAMPLE_EMAIL} permisos=${permissions.length} mensajes=${historyCount} archivo=${fileBytes.length} bytes`,
+    `   cuenta=${manifest.account.email} permisos=${permissions.length} mensajes=${historyCount} bytes=${sampleFileEntry.size}`,
   )
+  console.log(`   backup_dir=${backupDir}`)
   console.log('   registro: ' + REGISTRY)
+
+  // Limpieza del SQL temporal: el respaldo en disco sigue siendo la fuente.
+  rmSync(workDir, { recursive: true, force: true })
 }
 
 function prepareRestoreStack(): {
@@ -526,8 +448,6 @@ function prepareRestoreStack(): {
   secretKey: string
   publishableKey: string
 } {
-  // Configuración con puertos propios: la segunda instancia no puede chocar
-  // con la de desarrollo.
   mkdirSync(join(RESTORE_STACK_DIR, 'supabase'), { recursive: true })
   const base = readFileSync(join(REPO_ROOT, 'supabase/ci/config.toml'), 'utf8')
   const replacements: [string, string][] = [
@@ -542,8 +462,6 @@ function prepareRestoreStack(): {
   writeFileSync(join(RESTORE_STACK_DIR, 'supabase/config.toml'), config)
 
   const readStatus = (): Record<string, string> => {
-    // `supabase status` falla si el stack no está levantado: eso no es un
-    // error del ensayo, es la señal de que hay que arrancarlo.
     try {
       const out = sh('supabase', ['status', '-o', 'env'], {
         cwd: RESTORE_STACK_DIR,

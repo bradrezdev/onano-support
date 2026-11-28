@@ -1,86 +1,89 @@
 #!/usr/bin/env bash
-# Respaldo de la base de desarrollo y demostración de que se restaura en otra
-# instancia.
+# Respaldo de la base de desarrollo y demostración de que se restaura desde
+# disco con el origen desconectado.
 #
-# Qué deja:
-#   1 · un volcado (formato custom de pg_dump) del esquema `public` —el del
-#       CRM— con sus datos, en un archivo FUERA de la base;
-#   2 · una restauración real en OTRA instancia (un contenedor postgres nuevo,
-#       sin nada de Supabase) para demostrar que el volcado sirve;
-#   3 · el conteo de filas de las tablas clave en la copia restaurada, para
-#      cotejar contra el original.
-#
-# Dónde queda el esquema que protege a la base: el REPO (`supabase/migrations`),
-# no la base. El ledger `public.schema_migrations` dentro de la base es solo
-# contabilidad de lo que YA se aplicó; la verdad son los archivos versionados.
+# Qué hace:
+#   1 · Crea un respaldo autocontenido con create-backup.ts (esquema public,
+#       objetos de whatsapp-media y manifiesto con sha256).
+#   2 · Detiene los contenedores del origen para demostrar que la restauración
+#       no depende de él.
+#   3 · Restaura el respaldo en la instancia de restauración con
+#       restore-rehearsal.ts.
+#   4 · Vuelve a arrancar el origen (incluso si la restauración falla).
+#   5 · Imprime el veredicto y el registro que se añadió.
 #
 #   bash scripts/dev/backup-and-verify-restore.sh
 set -euo pipefail
 
-STACK_DIR="${SUPABASE_STACK_DIR:-$HOME/supabase-dev/onano-support-dev}"
-BACKUP_DIR="${BACKUP_DIR:-$HOME/supabase-dev/backups}"
 PROJECT="onano-support-dev"
-CONTAINER="supabase_db_${PROJECT}"
-STAMP="$(date +%Y%m%d-%H%M%S)"
-DUMP="${BACKUP_DIR}/${PROJECT}-${STAMP}.dump"
+ORIGIN_CONTAINERS=(
+  "supabase_db_${PROJECT}"
+  "supabase_rest_${PROJECT}"
+  "supabase_auth_${PROJECT}"
+  "supabase_kong_${PROJECT}"
+  "supabase_storage_${PROJECT}"
+)
+REGISTRY="${HOME}/supabase-dev/backups/registry.jsonl"
+# URL pública del origen (la que tiene el .env de la API). Se toma ANTES de
+# cambiar de directorio, porque el script entra en apps/api.
+ORIGIN_API="$(grep -E '^SUPABASE_URL=' apps/api/.env | head -n 1 | cut -d= -f2- | tr -d '"' || true)"
 
-mkdir -p "${BACKUP_DIR}"
+restore_origin() {
+  echo "== (trap) reanudando origen =="
+  docker start "${ORIGIN_CONTAINERS[@]}" > /dev/null 2>&1 || true
+}
+trap restore_origin EXIT
 
-if ! docker ps --format '{{.Names}}' | grep -qx "${CONTAINER}"; then
-  echo "No está corriendo el stack de desarrollo (${CONTAINER})." >&2
+echo "== 1 · crear respaldo =="
+BACKUP_DIR="$(cd apps/api && pnpm exec tsx scripts/create-backup.ts | tail -n 1)"
+if [ -z "${BACKUP_DIR}" ] || [ ! -d "${BACKUP_DIR}" ]; then
+  echo "No se pudo crear el respaldo." >&2
   exit 1
 fi
-
-echo "== 1 · volcado del esquema public =="
-docker exec "${CONTAINER}" pg_dump -U postgres -d postgres --format=custom --schema=public --file=/tmp/backup.dump
-docker cp "${CONTAINER}:/tmp/backup.dump" "${DUMP}"
-docker exec "${CONTAINER}" rm -f /tmp/backup.dump
-SIZE="$(du -h "${DUMP}" | cut -f1)"
-echo "   ${DUMP} (${SIZE})"
+echo "   respaldo=${BACKUP_DIR}"
 
 echo
-echo "== 2 · conteos en el original =="
-ORIGINAL="$(docker exec "${CONTAINER}" psql -U postgres -d postgres -tAc "
-  select 'profiles='||(select count(*) from public.profiles)
-      ||' contacts='||(select count(*) from public.contacts)
-      ||' conversations='||(select count(*) from public.conversations)
-      ||' messages='||(select count(*) from public.messages)
-      ||' tickets='||(select count(*) from public.tickets)
-      ||' migraciones='||(select count(*) from public.schema_migrations);")"
-echo "   ${ORIGINAL}"
-
-echo
-echo "== 3 · restauración en OTRA instancia (contenedor postgres nuevo) =="
-RESTORE_CONTAINER="crm_restore_check"
-docker rm -f "${RESTORE_CONTAINER}" > /dev/null 2>&1 || true
-docker run -d --name "${RESTORE_CONTAINER}" -e POSTGRES_PASSWORD=postgres postgres:15 > /dev/null
-for i in $(seq 1 30); do
-  if docker exec "${RESTORE_CONTAINER}" pg_isready -U postgres > /dev/null 2>&1; then break; fi
-  sleep 1
-done
-docker cp "${DUMP}" "${RESTORE_CONTAINER}:/tmp/backup.dump"
-docker exec "${RESTORE_CONTAINER}" pg_restore -U postgres -d postgres --clean --if-exists --no-owner --no-privileges /tmp/backup.dump > /tmp/restore.log 2>&1 || {
-  echo "   La restauración reportó avisos (revisar /tmp/restore.log):" >&2
-  tail -5 /tmp/restore.log >&2
-}
-RESTORED="$(docker exec "${RESTORE_CONTAINER}" psql -U postgres -d postgres -tAc "
-  select 'profiles='||(select count(*) from public.profiles)
-      ||' contacts='||(select count(*) from public.contacts)
-      ||' conversations='||(select count(*) from public.conversations)
-      ||' messages='||(select count(*) from public.messages)
-      ||' tickets='||(select count(*) from public.tickets)
-      ||' migraciones='||(select count(*) from public.schema_migrations);")"
-echo "   ${RESTORED}"
-
-echo
-if [ "${ORIGINAL}" = "${RESTORED}" ]; then
-  echo "== OK · el volcado se restauró íntegro en otra instancia =="
-  echo "   ${DUMP}"
-  docker rm -f "${RESTORE_CONTAINER}" > /dev/null
-else
-  echo "== FALLO · los conteos no coinciden ==" >&2
-  echo "   original:  ${ORIGINAL}" >&2
-  echo "   restaurado:${RESTORED}" >&2
-  docker rm -f "${RESTORE_CONTAINER}" > /dev/null
+echo "== 2 · detener origen =="
+docker stop "${ORIGIN_CONTAINERS[@]}" > /dev/null 2>&1 || true
+sleep 2
+RUNNING_ORIGIN="$(docker ps --format '{{.Names}}' | grep -E "^supabase_(db|rest|auth|kong|storage)_${PROJECT}$" || true)"
+if [ -n "${RUNNING_ORIGIN}" ]; then
+  echo "No se pudo detener el origen completamente:" >&2
+  echo "${RUNNING_ORIGIN}" >&2
   exit 1
+fi
+echo "   origen detenido"
+
+echo
+echo "== 3 · restaurar desde disco (origen desconectado) =="
+RESTORE_EXIT=0
+cd apps/api && pnpm exec tsx scripts/restore-rehearsal.ts --backup "${BACKUP_DIR}" || RESTORE_EXIT=$?
+
+echo
+echo "== 4 · prueba de desconexión del origen =="
+RUNNING_DURING_RESTORE="$(docker ps --format '{{.Names}}' | grep -E "^supabase_(db|rest|auth|kong|storage)_${PROJECT}$" || true)"
+if [ -n "${RUNNING_DURING_RESTORE}" ]; then
+  echo "ADVERTENCIA: el origen se reanudó antes de tiempo:" >&2
+  echo "${RUNNING_DURING_RESTORE}" >&2
+elif [ -n "${ORIGIN_API}" ] && curl -s -o /dev/null --max-time 5 "${ORIGIN_API}/auth/v1/health"; then
+  echo "ADVERTENCIA: el origen SIGUE RESPONDIENDO en ${ORIGIN_API}." >&2
+  echo "   La restauración no se puede haber hecho sin él: la demostración es falsa." >&2
+  exit 1
+else
+  echo "   Origen desconectado durante la restauración: sin contenedores y ${ORIGIN_API} inaccesible."
+fi
+
+echo
+if [ "${RESTORE_EXIT}" -ne 0 ]; then
+  echo "== FALLO · la restauración no pudo reconstruir el respaldo ==" >&2
+  exit "${RESTORE_EXIT}"
+fi
+
+echo "== OK · el respaldo se restauró y verificó con el origen apagado =="
+echo "   backup_dir=${BACKUP_DIR}"
+if [ -f "${REGISTRY}" ]; then
+  echo "   registro="
+  tail -n 1 "${REGISTRY}"
+else
+  echo "   (sin registro)"
 fi

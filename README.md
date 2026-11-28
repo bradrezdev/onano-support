@@ -448,6 +448,7 @@ CLAUDE.md                   # guía de trabajo para agentes y personas
 ## Consideraciones operativas
 
 - **`scripts/db.ts` y los smoke tests usan `DATABASE_URL` (superuser) y la service-role key.** Nunca los apuntes a una base compartida o de producción.
+- **`bash scripts/dev/backup-and-verify-restore.sh` demuestra el respaldo desde disco**: crea un respaldo autocontenido, detiene el origen, lo restaura en otra instancia y verifica identidad, permisos, relación cuenta-chat, historial y bytes del adjunto. Ver `docs/respaldos.md`.
 - **El service-role key es un superusuario de la base.** Trátalo como tal. Nunca debe llegar al navegador — por eso vive solo en `apps/api/.env` y `SUPABASE_SECRET_KEY` no tiene prefijo público.
 - **`next dev` reinyecta `apps/api/AGENTS.md`** en cada arranque; no lo borres a mano.
 - **Instancias de dev zombis.** `pnpm -r --parallel` no mata una instancia anterior. Antes de arrancar: `lsof -nP -iTCP:3000 -sTCP:LISTEN`. Matar solo la API no alcanza — la mitad web revienta igual con `EADDRINUSE`.
