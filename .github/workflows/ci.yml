@@ -3,8 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
+  # Sin filtro de rama: los controles tienen que correr en CADA PR, también
+  # en los apilados (un PR cuya base es la rama de otro PR).
   pull_request:
-    branches: [main]
   # Manual run: lets a branch be verified before it is proposed to main.
   # `controlled_failure` injects a deliberate failure to prove that the
   # matching gate turns RED (the closing criterion of E1).
