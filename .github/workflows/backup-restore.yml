@@ -65,10 +65,16 @@ jobs:
       # ------------------------------------------------------------------
       # 2 · Crear el respaldo.
       # ------------------------------------------------------------------
+      - name: Seed synthetic data
+        run: pnpm --filter @crm/api exec tsx scripts/seed-synthetic.ts
+
       - name: Create backup
         id: create_backup
         env:
           ORIGIN_STACK_DIR: ${{ runner.temp }}/sb-origin
+          # El contenedor del origen en CI se llama distinto al de la maquina:
+          # el project_id de supabase/ci/config.toml es "onano-support-ci".
+          ORIGIN_DB_CONTAINER: supabase_db_onano-support-ci
         run: |
           set -euo pipefail
           BACKUP_DIR="$(cd apps/api && pnpm exec tsx scripts/create-backup.ts | tail -n 1)"
