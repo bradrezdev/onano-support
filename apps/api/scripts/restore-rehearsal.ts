@@ -71,6 +71,10 @@ function register(entry: Record<string, unknown>) {
   appendFileSync(REGISTRY, JSON.stringify(entry) + '\n')
 }
 
+// Directorio temporal de trabajo: si el ensayo falla a media restauracion, no
+// puede quedar tirado en /tmp.
+let WORK_DIR: string | null = null
+
 function fail(step: string, detail: string): never {
   register({
     objetivo: 'ensayo de respaldo y restauración',
@@ -84,6 +88,7 @@ function fail(step: string, detail: string): never {
   })
   console.error(`\nFALLO en ${step}: ${detail}`)
   console.error('El ensayo NO se declara exitoso. Registro: ' + REGISTRY)
+  if (WORK_DIR) rmSync(WORK_DIR, { recursive: true, force: true })
   process.exit(1)
 }
 
@@ -153,7 +158,12 @@ async function main() {
   const manifestPath = join(backupDir, 'manifest.json')
   if (!existsSync(manifestPath)) fail('argumentos', `no existe el manifiesto: ${manifestPath}`)
 
-  const manifest: BackupManifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  let manifest: BackupManifest
+  try {
+    manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as BackupManifest
+  } catch (e) {
+    fail('argumentos', `el manifiesto no es JSON valido: ${(e as Error).message}`)
+  }
   mkdirSync(BACKUP_DIR, { recursive: true })
 
   // ---------------------------------------------------------------- 1 · integridad
@@ -246,6 +256,7 @@ async function main() {
   // El SQL de la muestra se escribe FUERA del respaldo: el directorio del
   // respaldo es la fuente y no se toca (su integridad está verificada).
   const workDir = mkdtempSync(join(tmpdir(), 'crm-restore-'))
+  WORK_DIR = workDir
   const sampleSqlPath = join(workDir, 'restore-sample.sql')
   writeFileSync(
     sampleSqlPath,
@@ -440,6 +451,7 @@ async function main() {
 
   // Limpieza del SQL temporal: el respaldo en disco sigue siendo la fuente.
   rmSync(workDir, { recursive: true, force: true })
+  WORK_DIR = null
 }
 
 function prepareRestoreStack(): {

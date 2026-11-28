@@ -63,10 +63,13 @@ echo
 echo "== 4 · prueba de desconexión del origen =="
 RUNNING_DURING_RESTORE="$(docker ps --format '{{.Names}}' | grep -E "^supabase_(db|rest|auth|kong|storage)_${PROJECT}$" || true)"
 if [ -n "${RUNNING_DURING_RESTORE}" ]; then
-  echo "ADVERTENCIA: el origen se reanudó antes de tiempo:" >&2
+  # El origen estaba arriba durante la restauración: la demostración es falsa
+  # (la restauración pudo haberlo usado). Esto es un fallo, no un aviso.
+  echo "FALLO: el origen estaba arriba durante la restauración:" >&2
   echo "${RUNNING_DURING_RESTORE}" >&2
+  exit 1
 elif [ -n "${ORIGIN_API}" ] && curl -s -o /dev/null --max-time 5 "${ORIGIN_API}/auth/v1/health"; then
-  echo "ADVERTENCIA: el origen SIGUE RESPONDIENDO en ${ORIGIN_API}." >&2
+  echo "FALLO: el origen SIGUE RESPONDIENDO en ${ORIGIN_API}." >&2
   echo "   La restauración no se puede haber hecho sin él: la demostración es falsa." >&2
   exit 1
 else

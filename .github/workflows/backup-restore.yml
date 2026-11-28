@@ -109,7 +109,10 @@ jobs:
           # tener los contenedores parados. Si el nombre de un contenedor
           # cambiara, el grep de arriba no lo vería y la demostración sería
           # falsa; el curl no depende de nombres.
-          ORIGIN_API="$(grep -E '^SUPABASE_URL=' apps/api/.env | head -n 1 | cut -d= -f2- | tr -d '"')"
+          ORIGIN_API="${SUPABASE_URL:-}"
+          if [ -z "${ORIGIN_API}" ] && [ -f apps/api/.env ]; then
+            ORIGIN_API="$(grep -E '^SUPABASE_URL=' apps/api/.env | head -n 1 | cut -d= -f2- | tr -d '"')"
+          fi
           if [ -n "${ORIGIN_API}" ]; then
             if curl -s -o /dev/null --max-time 5 "${ORIGIN_API}/auth/v1/health"; then
               echo "::error::El origen sigue respondiendo en ${ORIGIN_API}: la demostración no probaría nada"
@@ -117,7 +120,7 @@ jobs:
             fi
             echo "Origen inaccesible en ${ORIGIN_API} (verificado por curl)."
           else
-            echo "::error::No se pudo leer SUPABASE_URL del .env del origen"
+            echo "::error::No se pudo resolver la URL del origen (SUPABASE_URL)"
             exit 1
           fi
           echo "Origen desconectado."
