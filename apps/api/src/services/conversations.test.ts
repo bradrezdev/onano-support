@@ -34,6 +34,7 @@ class QueryMock {
 
 const mockAdmin: any = {
   from: vi.fn((): QueryMock => new QueryMock()),
+  rpc: vi.fn(),
 }
 
 vi.mock('@/lib/supabase/admin', () => ({
@@ -44,7 +45,12 @@ const conv = await import('./conversations')
 
 beforeEach(() => {
   mockAdmin.from.mockReset()
+  mockAdmin.rpc.mockReset()
 })
+
+function setNextRpc(payload: Response) {
+  mockAdmin.rpc.mockReturnValueOnce(Promise.resolve(payload))
+}
 
 function setNextFrom(payload: Response): QueryMock {
   const q = new QueryMock()
@@ -163,34 +169,81 @@ describe('appendInboundMessage', () => {
 // ---------------------------------------------------------------------------
 
 describe('appendOutboundMessage', () => {
-  it('inserts with direction out and sets twilio_status queued when twilio_sid provided', async () => {
-    const q = setNextFrom({
-      data: { id: 'm-4', conversation_id: 'c-1', direction: 'out', body: 'hola', media_urls: null, twilio_sid: 'SMout', twilio_status: 'queued', sent_by_id: 'u-1', created_at: '2026-01-01' },
+  it('writes through the guarded function, with the actor and the twilio state', async () => {
+    setNextRpc({
+      data: {
+        id: 'm-4',
+        conversation_id: 'c-1',
+        direction: 'out',
+        body: 'hola',
+        media_urls: [],
+        twilio_sid: 'SMout',
+        twilio_status: 'queued',
+        sent_by_id: 'u-1',
+        created_at: '2026-01-01',
+      },
       error: null,
     })
-    await conv.appendOutboundMessage({ conversation_id: 'c-1', body: 'hola', sent_by_id: 'u-1', twilio_sid: 'SMout' })
-    const insertCall = q.ops.find((o) => o.op === 'insert')!
-    const rows = insertCall.args[0] as Record<string, unknown>
-    expect(rows).toMatchObject({
+
+    const message = await conv.appendOutboundMessage({
       conversation_id: 'c-1',
-      direction: 'out',
       body: 'hola',
       sent_by_id: 'u-1',
       twilio_sid: 'SMout',
-      twilio_status: 'queued',
+    })
+
+    const [fn, args] = mockAdmin.rpc.mock.calls[0]
+    expect(fn).toBe('append_outbound_message')
+    expect(args).toMatchObject({
+      p_conversation_id: 'c-1',
+      p_actor_id: 'u-1',
+      p_body: 'hola',
+      p_twilio_sid: 'SMout',
+      p_twilio_status: 'queued',
+    })
+    expect(message.id).toBe('m-4')
+  })
+
+  it('leaves the twilio state null when there is no sid (deferred HTTP send)', async () => {
+    setNextRpc({
+      data: {
+        id: 'm-5',
+        conversation_id: 'c-1',
+        direction: 'out',
+        body: 'aún sin enviar',
+        media_urls: [],
+        twilio_sid: null,
+        twilio_status: null,
+        sent_by_id: 'u-1',
+        created_at: '2026-01-01',
+      },
+      error: null,
+    })
+
+    await conv.appendOutboundMessage({
+      conversation_id: 'c-1',
+      body: 'aún sin enviar',
+      sent_by_id: 'u-1',
+    })
+
+    expect(mockAdmin.rpc.mock.calls[0][1]).toMatchObject({
+      p_twilio_sid: null,
+      p_twilio_status: null,
     })
   })
 
-  it('inserts with twilio_status null when no twilio_sid (deferred HTTP send)', async () => {
-    const q = setNextFrom({
-      data: { id: 'm-5', conversation_id: 'c-1', direction: 'out', body: 'aún sin enviar', media_urls: null, twilio_sid: null, twilio_status: null, sent_by_id: 'u-1', created_at: '2026-01-01' },
-      error: null,
-    })
-    await conv.appendOutboundMessage({ conversation_id: 'c-1', body: 'aún sin enviar', sent_by_id: 'u-1' })
-    const insertCall = q.ops.find((o) => o.op === 'insert')!
-    const rows = insertCall.args[0] as Record<string, unknown>
-    expect(rows.twilio_sid).toBeNull()
-    expect(rows.twilio_status).toBeNull()
+  it('maps "the chat changed hands" to 409', async () => {
+    setNextRpc({ data: null, error: { code: 'C0009', message: 'assignment_changed' } })
+    await expect(
+      conv.appendOutboundMessage({ conversation_id: 'c-1', body: 'hola', sent_by_id: 'u-2' }),
+    ).rejects.toMatchObject({ code: 'assignment_changed', status: 409 })
+  })
+
+  it('maps "nobody holds this chat" to 409', async () => {
+    setNextRpc({ data: null, error: { code: 'C0008', message: 'conversation_unassigned' } })
+    await expect(
+      conv.appendOutboundMessage({ conversation_id: 'c-1', body: 'hola', sent_by_id: 'u-1' }),
+    ).rejects.toMatchObject({ code: 'conversation_unassigned', status: 409 })
   })
 })
 

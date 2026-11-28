@@ -65,6 +65,16 @@ export async function GET(request: Request, ctx: Params) {
 
 const ConversationPatchBody = z.object({
   assigned_agent_id: z.string().uuid().nullable(),
+  /**
+   * Mandatory: a handover without a reason is not auditable. The reason
+   * lands in `conversation_audit_log` next to the actor and the holders.
+   */
+  reason: z.string().trim().min(1).max(500),
+  /**
+   * The version the client saw. If the chat changed meanwhile the transfer
+   * is rejected with 409 instead of overwriting the other change.
+   */
+  expected_version: z.number().int().positive(),
 })
 
 /**
@@ -84,6 +94,8 @@ export async function PATCH(request: Request, ctx: Params) {
       id,
       parsed.data.assigned_agent_id,
       auth.user.id,
+      parsed.data.reason,
+      parsed.data.expected_version,
     )
     return NextResponse.json({ data: conversation })
   } catch (err) {

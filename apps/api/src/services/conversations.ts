@@ -19,6 +19,11 @@ export interface Conversation {
   last_message_preview: string | null
   unread_count: number
   created_at: string
+  /**
+   * Bumped on every holder change. The client sends the version it saw and
+   * the API rejects a stale one instead of overwriting somebody else's work.
+   */
+  assignment_version: number
 }
 
 export interface ConversationWithContact extends Conversation {
@@ -27,6 +32,21 @@ export interface ConversationWithContact extends Conversation {
     whatsapp_number: string
     name: string | null
   } | null
+}
+
+/** La fila que devuelve `reassign_conversation` (ver la migración). */
+export interface ReassignedConversation {
+  conversation_id: string
+  contact_id: string
+  assigned_agent_id: string | null
+  status: Conversation['status']
+  last_message_at: string | null
+  last_message_preview: string | null
+  unread_count: number
+  created_at: string
+  assignment_version: number
+  previous_assignee_id: string | null
+  changed_at: string
 }
 
 export interface MessageRow {
@@ -51,6 +71,71 @@ export class ConversationError extends Error {
   }
 }
 
+/**
+ * The errors the authorization functions in the database raise. The SQLSTATE
+ * is the contract: the API turns it into an HTTP status and a stable code.
+ * The raised text equals the code, so the mapping survives even if the
+ * SQLSTATE does not reach the client.
+ */
+const RPC_ERRORS: Record<string, { code: string; message: string; status: number }> = {
+  C0001: {
+    code: 'reason_required',
+    message: 'Indica el motivo de la transferencia',
+    status: 400,
+  },
+  C0002: {
+    code: 'version_required',
+    message: 'Falta la versión vigente de la conversación',
+    status: 400,
+  },
+  C0003: {
+    code: 'conversation_not_found',
+    message: 'Conversación no encontrada',
+    status: 404,
+  },
+  C0004: {
+    code: 'version_conflict',
+    message: 'La conversación cambió mientras la transferías',
+    status: 409,
+  },
+  C0005: {
+    code: 'invalid_assignee',
+    message: 'El usuario asignado no existe o está inactivo',
+    status: 400,
+  },
+  C0006: { code: 'empty_body', message: 'El mensaje está vacío', status: 400 },
+  C0007: { code: 'forbidden', message: 'El actor no es válido', status: 403 },
+  C0008: {
+    code: 'conversation_unassigned',
+    message: 'La conversación no tiene titular: tómala antes de responder',
+    status: 409,
+  },
+  C0009: {
+    code: 'assignment_changed',
+    message: 'Esta conversación cambió de titular: tu mensaje no se guardó',
+    status: 409,
+  },
+  C0010: {
+    code: 'already_taken',
+    message: 'Otra persona ya tomó esta conversación',
+    status: 409,
+  },
+}
+
+function mapRpcError(error: { code?: string; message?: string }): ConversationError {
+  const byState = error.code ? RPC_ERRORS[error.code] : undefined
+  if (byState) return new ConversationError(byState.code, byState.message, byState.status)
+
+  const text = (error.message ?? '').trim()
+  const byText = Object.values(RPC_ERRORS).find((e) => e.code === text)
+  if (byText) return new ConversationError(byText.code, byText.message, byText.status)
+
+  if (error.code === '23505') {
+    return new ConversationError('duplicate', 'Ese registro ya existe', 409)
+  }
+  return new ConversationError('db_error', text || 'Error de base de datos', 500)
+}
+
 export async function listConversations(filter: {
   contact_id?: string
   assigned_agent_id?: string
@@ -62,7 +147,7 @@ export async function listConversations(filter: {
   const admin = createSupabaseAdminClient()
   let q = admin
     .from('conversations')
-    .select('id, contact_id, assigned_agent_id, status, last_message_at, last_message_preview, unread_count, created_at, contacts(id, whatsapp_number, name)')
+    .select('id, contact_id, assigned_agent_id, status, last_message_at, last_message_preview, unread_count, created_at, assignment_version, contacts(id, whatsapp_number, name)')
     .order('last_message_at', { ascending: false, nullsFirst: false })
     .limit(filter.limit ?? 100)
 
@@ -150,6 +235,14 @@ export async function appendInboundMessage(input: {
   return data
 }
 
+/**
+ * Persist an outbound reply.
+ *
+ * The write goes through `append_outbound_message` (SECURITY DEFINER) so the
+ * assignment check and the insert happen in ONE transaction: if the chat
+ * changed hands while the agent was typing, nothing is written and the caller
+ * gets `assignment_changed`.
+ */
 export async function appendOutboundMessage(input: {
   conversation_id: string
   body: string
@@ -157,20 +250,21 @@ export async function appendOutboundMessage(input: {
   twilio_sid?: string
 }): Promise<MessageRow> {
   const admin = createSupabaseAdminClient()
-  const { data, error } = await admin
-    .from('messages')
-    .insert({
-      conversation_id: input.conversation_id,
-      direction: 'out',
-      body: input.body,
-      sent_by_id: input.sent_by_id,
-      twilio_sid: input.twilio_sid ?? null,
-      twilio_status: input.twilio_sid ? 'queued' : null,
-    })
-    .select('id, conversation_id, direction, body, media_urls, twilio_sid, twilio_status, sent_by_id, created_at')
-    .single<MessageRow>()
-  if (error) throw error
-  return data
+  const { data, error } = await admin.rpc('append_outbound_message', {
+    p_conversation_id: input.conversation_id,
+    p_actor_id: input.sent_by_id,
+    p_body: input.body,
+    p_media_urls: [],
+    p_twilio_sid: input.twilio_sid ?? null,
+    p_twilio_status: input.twilio_sid ? 'queued' : null,
+  })
+  if (error) throw mapRpcError(error)
+
+  const row = (Array.isArray(data) ? data[0] : data) as MessageRow | null
+  if (!row) {
+    throw new ConversationError('db_error', 'No se pudo guardar el mensaje', 500)
+  }
+  return row
 }
 
 export async function updateMessageStatusBySid(
@@ -195,7 +289,7 @@ export async function getConversationDetail(id: string): Promise<{
   const [{ data: conv, error: cErr }, { data: msgs, error: mErr }] = await Promise.all([
     admin
       .from('conversations')
-      .select('id, contact_id, assigned_agent_id, status, last_message_at, last_message_preview, unread_count, created_at, contacts(id, whatsapp_number, name)')
+      .select('id, contact_id, assigned_agent_id, status, last_message_at, last_message_preview, unread_count, created_at, assignment_version, contacts(id, whatsapp_number, name)')
       .eq('id', id)
       .maybeSingle<ConversationWithContact>(),
     admin
@@ -219,11 +313,44 @@ export async function getConversationDetail(id: string): Promise<{
  * conversation the caller is not entitled to read.
  */
 export function canAccessConversation(
-  viewer: { id: string; role: 'admin' | 'supervisor' | 'soporte' },
+  viewer: { id: string; role?: string | null; role_key?: string | null },
   conversation: { assigned_agent_id: string | null },
 ): boolean {
-  if (viewer.role === 'admin' || viewer.role === 'supervisor') return true
+  // `role_key` es la verdad; `role` es la columna heredada.
+  if (isPrivileged(viewer)) return true
   if (conversation.assigned_agent_id === null) return true
+  return conversation.assigned_agent_id === viewer.id
+}
+
+/**
+ * `role_key` is the truth; `role` is the legacy column. A custom role is not
+ * privileged just because it was granted powerful permissions.
+ */
+export function isPrivileged(viewer: {
+  role?: string | null
+  role_key?: string | null
+}): boolean {
+  const key = viewer.role_key ?? viewer.role
+  return key === 'admin' || key === 'supervisor'
+}
+
+/**
+ * Who may WRITE in a conversation.
+ *
+ * Reading is broader than writing: an admin or supervisor reads every chat,
+ * but writing follows the HOLDER. An unassigned chat has no holder — you have
+ * to take it before answering.
+ *
+ * The check that actually decides lives in the database
+ * (`append_outbound_message`), inside the same transaction as the insert.
+ * This one is for the routes that need to answer before they write.
+ */
+export function canWriteConversation(
+  viewer: { id: string; role?: string | null; role_key?: string | null },
+  conversation: { assigned_agent_id: string | null },
+): boolean {
+  if (isPrivileged(viewer)) return true
+  if (conversation.assigned_agent_id === null) return false
   return conversation.assigned_agent_id === viewer.id
 }
 
@@ -231,7 +358,7 @@ export async function findConversationOrThrow(id: string): Promise<Conversation>
   const admin = createSupabaseAdminClient()
   const { data, error } = await admin
     .from('conversations')
-    .select('id, contact_id, assigned_agent_id, status, last_message_at, last_message_preview, unread_count, created_at')
+    .select('id, contact_id, assigned_agent_id, status, last_message_at, last_message_preview, unread_count, created_at, assignment_version')
     .eq('id', id)
     .maybeSingle<Conversation>()
   if (error) throw error
@@ -243,73 +370,73 @@ export async function findConversationOrThrow(id: string): Promise<Conversation>
  * W4: Admin and Supervisor hand a conversation to someone else.
  *
  * Guard rails:
- *   - cannot assign to a suspended/deleted profile
- *   - cannot assign to yourself while the conversation already belongs to
- *     someone else (that is a takeover, use reassign only downward)
+ *   - the target must exist and be active
+ *   - a REASON is mandatory: a handover without a reason is not auditable
+ *   - the caller sends the version it saw; if the chat changed meanwhile the
+ *     transfer is rejected (409) instead of overwriting the other change
  *
- * Passing `null` puts the conversation back in the unassigned queue.
+ * The change and its audit entry are written in ONE transaction by
+ * `reassign_conversation` (SECURITY DEFINER): actor, previous holder, new
+ * holder, reason and date. Passing `null` puts the conversation back in the
+ * unassigned queue.
  */
 export async function reassignConversation(
   id: string,
   assignedAgentId: string | null,
   actorId: string,
+  reason: string,
+  expectedVersion: number,
 ): Promise<Conversation> {
   const admin = createSupabaseAdminClient()
 
-  if (assignedAgentId) {
-    const { data: target, error: tErr } = await admin
-      .from('profiles')
-      .select('id, display_name, suspended_at, deleted_at')
-      .eq('id', assignedAgentId)
-      .maybeSingle<{
-        id: string
-        display_name: string | null
-        suspended_at: string | null
-        deleted_at: string | null
-      }>()
-    if (tErr) throw tErr
-    if (!target) {
-      throw new ConversationError('assignee_not_found', 'El usuario asignado no existe', 400)
-    }
-    if (target.suspended_at || target.deleted_at) {
-      throw new ConversationError('assignee_inactive', 'El usuario asignado está inactivo', 400)
-    }
-  }
+  const { data, error } = await admin.rpc('reassign_conversation', {
+    p_conversation_id: id,
+    p_actor_id: actorId,
+    p_new_assignee_id: assignedAgentId,
+    p_reason: reason,
+    p_expected_version: expectedVersion,
+  })
+  if (error) throw mapRpcError(error)
 
-  const { data, error } = await admin
-    .from('conversations')
-    .update({ assigned_agent_id: assignedAgentId })
-    .eq('id', id)
-    .select('id, contact_id, assigned_agent_id, status, last_message_at, last_message_preview, unread_count, created_at')
-    .single<Conversation>()
-  if (error) throw error
-  void actorId
-  return data
+  // La forma la define la función: sin un cast laxo, porque un cast que
+  // promete campos que el RPC no devuelve esconde el error hasta el cliente.
+  const row = (Array.isArray(data) ? data[0] : data) as ReassignedConversation | null
+  if (!row) {
+    throw new ConversationError('db_error', 'No se pudo transferir la conversación', 500)
+  }
+  return {
+    id: row.conversation_id,
+    contact_id: row.contact_id,
+    assigned_agent_id: row.assigned_agent_id,
+    status: row.status,
+    last_message_at: row.last_message_at,
+    last_message_preview: row.last_message_preview,
+    unread_count: row.unread_count,
+    created_at: row.created_at,
+    assignment_version: row.assignment_version,
+  }
 }
 
 /**
  * Recommendation 7: an agent claims an unassigned conversation ("Tomar").
  * Fails when somebody already claimed it — two agents pressing the button at
- * the same time must not silently overwrite each other.
+ * the same time must not silently overwrite each other. Taking also changes
+ * the holder, so it bumps the version and leaves an audit entry.
  */
 export async function takeConversation(id: string, actorId: string): Promise<Conversation> {
   const admin = createSupabaseAdminClient()
-  const { data, error } = await admin
-    .from('conversations')
-    .update({ assigned_agent_id: actorId })
-    .eq('id', id)
-    .is('assigned_agent_id', null)
-    .select('id, contact_id, assigned_agent_id, status, last_message_at, last_message_preview, unread_count, created_at')
-    .maybeSingle<Conversation>()
-  if (error) throw error
-  if (!data) {
-    throw new ConversationError(
-      'already_taken',
-      'Otra persona ya tomó esta conversación',
-      409,
-    )
+
+  const { data, error } = await admin.rpc('take_conversation', {
+    p_conversation_id: id,
+    p_actor_id: actorId,
+  })
+  if (error) throw mapRpcError(error)
+
+  const row = (Array.isArray(data) ? data[0] : data) as Conversation | null
+  if (!row) {
+    throw new ConversationError('db_error', 'No se pudo tomar la conversación', 500)
   }
-  return data
+  return row
 }
 
 /**
@@ -342,7 +469,7 @@ export async function escalateConversation(
     .from('conversations')
     .update({ escalated_to_id: toUserId, escalated_by_id: actorId, escalated_at: new Date().toISOString() })
     .eq('id', id)
-    .select('id, contact_id, assigned_agent_id, status, last_message_at, last_message_preview, unread_count, created_at')
+    .select('id, contact_id, assigned_agent_id, status, last_message_at, last_message_preview, unread_count, created_at, assignment_version')
     .single<Conversation>()
   if (error) throw error
   return { conversation: data, escalated_to: toUserId }

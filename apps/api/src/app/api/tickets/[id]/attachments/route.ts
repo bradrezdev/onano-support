@@ -27,7 +27,7 @@ export async function GET(request: Request, ctx: Params) {
   const { id } = await ctx.params
 
   try {
-    return NextResponse.json({ data: await listTicketAttachments(id) })
+    return NextResponse.json({ data: await listTicketAttachments(id, auth.user) })
   } catch (err) {
     if (err instanceof AttachmentError) {
       return NextResponse.json(
@@ -62,6 +62,7 @@ export async function POST(request: Request, ctx: Params) {
       parsed.data.message_ids,
       auth.user.id,
       parsed.data.note,
+      auth.user,
     )
     return NextResponse.json({ data: result }, { status: 201 })
   } catch (err) {

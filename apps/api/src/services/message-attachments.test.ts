@@ -30,6 +30,12 @@ class QueryMock {
 
 const mockAdmin: any = {
   from: vi.fn((): QueryMock => new QueryMock()),
+  storage: {
+    from: vi.fn(() => ({
+      createSignedUrl: vi.fn(),
+      remove: vi.fn(),
+    })),
+  },
 }
 
 vi.mock('@/lib/supabase/admin', () => ({
@@ -41,6 +47,13 @@ const attachments = await import('./message-attachments')
 beforeEach(() => {
   mockAdmin.from.mockReset()
 })
+
+/** El titular del ticket: puede leer y trabajar sus adjuntos. */
+const holder = { id: 'u-1', role: 'soporte' as const, role_key: 'soporte' }
+/** Un agente ajeno: ni titular del ticket ni de ningún chat. */
+const outsider = { id: 'u-99', role: 'soporte' as const, role_key: 'soporte' }
+/** La respuestas del ticket con su titular. */
+const ticketOfHolder = { id: 'tk-1', assigned_to: 'u-1' }
 
 function setNextFrom(payload: Response): QueryMock {
   const q = new QueryMock()
@@ -100,7 +113,7 @@ describe('listAttachableMessages', () => {
 
 describe('attachMessages', () => {
   it('returns zero for an empty selection without touching the DB', async () => {
-    const out = await attachments.attachMessages('tk-1', [], 'u-1')
+    const out = await attachments.attachMessages('tk-1', [], 'u-1', undefined, holder)
     expect(out).toEqual({ attached: 0, skipped: 0 })
     expect(mockAdmin.from).not.toHaveBeenCalled()
   })
@@ -108,7 +121,7 @@ describe('attachMessages', () => {
   it('refuses to attach to a ticket that does not exist', async () => {
     setNextFrom({ data: null, error: null }) // ticket lookup
     await expect(
-      attachments.attachMessages('tk-ghost', ['msg-1'], 'u-1'),
+      attachments.attachMessages('tk-ghost', ['msg-1'], 'u-1', undefined, holder),
     ).rejects.toMatchObject({ code: 'ticket_not_found', status: 404 })
   })
 
@@ -116,26 +129,44 @@ describe('attachMessages', () => {
     // The lookup filters deleted_at is null, so a trashed ticket yields no row.
     const q = setNextFrom({ data: null, error: null })
     await expect(
-      attachments.attachMessages('tk-1', ['msg-1'], 'u-1'),
+      attachments.attachMessages('tk-1', ['msg-1'], 'u-1', undefined, holder),
     ).rejects.toMatchObject({ code: 'ticket_not_found' })
     expect(q.ops.some((o) => o.op === 'is' && o.args[0] === 'deleted_at')).toBe(true)
   })
 
+  it('refuses to attach when the caller does not own the ticket', async () => {
+    setNextFrom({ data: ticketOfHolder, error: null }) // ticket lookup
+    setNextFrom({ data: [{ message_id: 'msg-1' }], error: null }) // attached messages
+    setNextFrom({ data: [], error: null }) // conversations of those messages
+    setNextFrom({ data: [], error: null }) // conversations owned by the caller
+
+    await expect(
+      attachments.attachMessages('tk-1', ['msg-1'], 'u-99', undefined, outsider),
+    ).rejects.toMatchObject({ code: 'forbidden', status: 403 })
+  })
+
   it('rejects message ids that do not exist', async () => {
-    setNextFrom({ data: { id: 'tk-1' }, error: null }) // ticket exists
+    setNextFrom({ data: ticketOfHolder, error: null }) // ticket lookup
     setNextFrom({ data: [{ id: 'msg-1' }], error: null }) // only msg-1 exists
 
     await expect(
-      attachments.attachMessages('tk-1', ['msg-1', 'msg-99'], 'u-1'),
+      attachments.attachMessages('tk-1', ['msg-1', 'msg-99'], 'u-1', undefined, holder),
     ).rejects.toMatchObject({ code: 'message_not_found' })
   })
 
   it('writes one row per message with the actor recorded', async () => {
-    setNextFrom({ data: { id: 'tk-1' }, error: null })
-    setNextFrom({ data: [{ id: 'msg-1' }, { id: 'msg-2' }], error: null })
-    const upQ = setNextFrom({ data: null, error: null })
+    setNextFrom({ data: ticketOfHolder, error: null }) // ticket lookup
+    setNextFrom({ data: [{ id: 'msg-1' }, { id: 'msg-2' }], error: null }) // messages
+    setNextFrom({ data: [{ id: 'cv-1', assigned_agent_id: 'u-1' }], error: null }) // conversations
+    const upQ = setNextFrom({ data: null, error: null }) // upsert
 
-    const out = await attachments.attachMessages('tk-1', ['msg-1', 'msg-2'], 'u-9')
+    const out = await attachments.attachMessages(
+      'tk-1',
+      ['msg-1', 'msg-2'],
+      'u-9',
+      undefined,
+      holder,
+    )
 
     const rows = upQ.ops.find((o) => o.op === 'upsert')?.args[0] as Array<Record<string, unknown>>
     expect(rows).toHaveLength(2)
@@ -147,12 +178,23 @@ describe('attachMessages', () => {
     expect(out).toEqual({ attached: 2, skipped: 0 })
   })
 
+  it('refuses to attach a message from a conversation the caller cannot see', async () => {
+    setNextFrom({ data: ticketOfHolder, error: null }) // ticket lookup
+    setNextFrom({ data: [{ id: 'msg-1' }], error: null }) // messages
+    setNextFrom({ data: [{ id: 'cv-9', assigned_agent_id: 'u-42' }], error: null }) // conversations
+
+    await expect(
+      attachments.attachMessages('tk-1', ['msg-1'], 'u-9', undefined, holder),
+    ).rejects.toMatchObject({ code: 'forbidden', status: 403 })
+  })
+
   it('is idempotent: re-attaching the same message is a no-op upsert', async () => {
-    setNextFrom({ data: { id: 'tk-1' }, error: null })
+    setNextFrom({ data: ticketOfHolder, error: null })
     setNextFrom({ data: [{ id: 'msg-1' }], error: null })
+    setNextFrom({ data: [{ id: 'cv-1', assigned_agent_id: 'u-1' }], error: null })
     const upQ = setNextFrom({ data: null, error: null })
 
-    await attachments.attachMessages('tk-1', ['msg-1'], 'u-9')
+    await attachments.attachMessages('tk-1', ['msg-1'], 'u-9', undefined, holder)
 
     const opts = upQ.ops.find((o) => o.op === 'upsert')?.args[1] as
       | { onConflict: string; ignoreDuplicates: boolean }
@@ -162,11 +204,18 @@ describe('attachMessages', () => {
   })
 
   it('stores the optional note', async () => {
-    setNextFrom({ data: { id: 'tk-1' }, error: null })
+    setNextFrom({ data: ticketOfHolder, error: null })
     setNextFrom({ data: [{ id: 'msg-1' }], error: null })
+    setNextFrom({ data: [{ id: 'cv-1', assigned_agent_id: 'u-1' }], error: null })
     const upQ = setNextFrom({ data: null, error: null })
 
-    await attachments.attachMessages('tk-1', ['msg-1'], 'u-9', 'el que prueba el retraso')
+    await attachments.attachMessages(
+      'tk-1',
+      ['msg-1'],
+      'u-9',
+      'el que prueba el retraso',
+      holder,
+    )
 
     const rows = upQ.ops.find((o) => o.op === 'upsert')?.args[0] as Array<Record<string, unknown>>
     expect(rows[0]!.note).toBe('el que prueba el retraso')
@@ -179,6 +228,7 @@ describe('attachMessages', () => {
 
 describe('listTicketAttachments', () => {
   it('flattens the embedded message FK', async () => {
+    setNextFrom({ data: ticketOfHolder, error: null }) // ticket lookup
     setNextFrom({
       data: [
         {
@@ -193,7 +243,7 @@ describe('listTicketAttachments', () => {
       error: null,
     })
 
-    const out = await attachments.listTicketAttachments('tk-1')
+    const out = await attachments.listTicketAttachments('tk-1', holder)
 
     expect(out[0]).toMatchObject({
       message_id: 'msg-1',
@@ -204,6 +254,7 @@ describe('listTicketAttachments', () => {
   })
 
   it('survives a missing embedded message instead of throwing', async () => {
+    setNextFrom({ data: ticketOfHolder, error: null }) // ticket lookup
     setNextFrom({
       data: [
         {
@@ -218,20 +269,106 @@ describe('listTicketAttachments', () => {
       error: null,
     })
 
-    const out = await attachments.listTicketAttachments('tk-1')
+    const out = await attachments.listTicketAttachments('tk-1', holder)
     expect(out[0]?.body).toBeNull()
     expect(out[0]?.direction).toBe('in')
+  })
+
+  it('refuses to list the attachments of a ticket the caller does not own', async () => {
+    setNextFrom({ data: ticketOfHolder, error: null }) // ticket lookup
+    setNextFrom({ data: [{ message_id: 'msg-1' }], error: null }) // attached messages
+    setNextFrom({ data: [{ conversation_id: 'cv-1' }], error: null }) // conversations
+    setNextFrom({ data: [], error: null }) // conversations owned by the caller
+
+    await expect(
+      attachments.listTicketAttachments('tk-1', outsider),
+    ).rejects.toMatchObject({ code: 'forbidden', status: 403 })
   })
 })
 
 describe('detachMessage', () => {
   it('deletes the attachment row scoped to the ticket', async () => {
-    const q = setNextFrom({ data: null, error: null })
-    await expect(attachments.detachMessage('tk-1', 'msg-1')).resolves.toEqual({
-      detached: true,
-    })
+    setNextFrom({ data: ticketOfHolder, error: null }) // ticket lookup
+    setNextFrom({ data: { message_id: 'msg-1' }, error: null }) // the attachment
+    setNextFrom({ data: { id: 'msg-1', media_urls: [] }, error: null }) // the message
+    const q = setNextFrom({ data: null, error: null }) // the delete
+
+    await expect(
+      attachments.detachMessage('tk-1', 'msg-1', holder),
+    ).resolves.toEqual({ detached: true, file_deleted: false })
+
     const eqs = q.ops.filter((o) => o.op === 'eq').map((o) => o.args)
     expect(eqs).toContainEqual(['ticket_id', 'tk-1'])
     expect(eqs).toContainEqual(['message_id', 'msg-1'])
+  })
+
+  it('refuses to detach when the caller does not own the ticket', async () => {
+    setNextFrom({ data: ticketOfHolder, error: null }) // ticket lookup
+    setNextFrom({ data: [{ message_id: 'msg-1' }], error: null }) // attached messages
+    setNextFrom({ data: [{ conversation_id: 'cv-1' }], error: null }) // conversations
+    setNextFrom({ data: [], error: null }) // conversations owned by the caller
+
+    await expect(
+      attachments.detachMessage('tk-1', 'msg-1', outsider),
+    ).rejects.toMatchObject({ code: 'forbidden', status: 403 })
+  })
+})
+
+describe('getTicketAttachment', () => {
+  it('issues a signed URL for the file the app owns', async () => {
+    setNextFrom({ data: ticketOfHolder, error: null }) // ticket lookup
+    setNextFrom({
+      data: {
+        ticket_id: 'tk-1',
+        message_id: 'msg-1',
+        attached_by: 'u-9',
+        attached_at: '2026-01-02',
+        note: null,
+        messages: {
+          body: 'hola',
+          direction: 'in',
+          created_at: '2026-01-01',
+          media_urls: ['attachments/cv-1/factura.pdf'],
+        },
+      },
+      error: null,
+    })
+    const createSignedUrl = vi.fn().mockResolvedValue({
+      data: { signedUrl: 'https://signed.example/factura.pdf' },
+      error: null,
+    })
+    mockAdmin.storage.from.mockReturnValue({ createSignedUrl, remove: vi.fn() })
+
+    const out = await attachments.getTicketAttachment('tk-1', 'msg-1', holder)
+
+    expect(createSignedUrl).toHaveBeenCalledWith('attachments/cv-1/factura.pdf', 300)
+    expect(out.media_url).toBe('https://signed.example/factura.pdf')
+  })
+
+  it('never serves an external Twilio URL', async () => {
+    setNextFrom({ data: ticketOfHolder, error: null }) // ticket lookup
+    setNextFrom({
+      data: {
+        ticket_id: 'tk-1',
+        message_id: 'msg-1',
+        attached_by: 'u-9',
+        attached_at: '2026-01-02',
+        note: null,
+        messages: {
+          body: 'hola',
+          direction: 'in',
+          created_at: '2026-01-01',
+          media_urls: ['https://api.twilio.com/media/abc'],
+        },
+      },
+      error: null,
+    })
+    const createSignedUrl = vi.fn()
+    mockAdmin.storage.from.mockReturnValue({ createSignedUrl, remove: vi.fn() })
+
+    const out = await attachments.getTicketAttachment('tk-1', 'msg-1', holder)
+
+    expect(createSignedUrl).not.toHaveBeenCalled()
+    expect(out.media_url).toBeNull()
   })
 })
