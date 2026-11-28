@@ -365,10 +365,17 @@ El **esquema vive fuera de la base**: `supabase/migrations/*.sql` es la fuente d
 Antes de habilitar datos reales, el validador da el veredicto:
 
 ```bash
-pnpm --filter @crm/api exec tsx scripts/validate-access-controls.ts
+pnpm --filter @crm/api exec tsx scripts/validate-access-controls.ts          # informe
+pnpm --filter @crm/api exec tsx scripts/validate-access-controls.ts --strict # sale con 1 si algo queda PENDIENTE
 ```
 
-Mientras el veredicto diga que el entorno no puede recibir datos reales, **el entorno se mantiene sintético**.
+Mientras el veredicto diga que el entorno no puede recibir datos reales, **el entorno se mantiene sintético**. Última corrida: **6 controles OK, 0 pendientes**.
+
+### Autorización de conversaciones y adjuntos
+
+- Escribir en un chat y transferirlo son operaciones **transaccionales** en la base (`append_outbound_message`, `reassign_conversation`, `take_conversation`): la validación del titular y el guardado ocurren en la misma operación, así que un chat que cambió de manos mientras el agente redactaba **no guarda nada** y la interfaz lo informa (`409 assignment_changed`).
+- Transferir exige **motivo** y **versión vigente** (`{ assigned_agent_id, reason, expected_version }`); una versión obsoleta se rechaza con `409 version_conflict`. El cambio y su bitácora (`conversation_audit_log`) se escriben en la misma transacción.
+- Los adjuntos se autorizan por pertenencia (titular del ticket, titular del chat del mensaje, o admin/supervisor) y el archivo se sirve por **URL firmada**; el bucket es privado y ya no tiene políticas para `authenticated`.
 
 ### Base de datos
 
