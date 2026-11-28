@@ -6,34 +6,48 @@
  * demuestra que el respaldo es autocontenido: el origen puede estar apagado.
  *
  * Pasos:
- *   1 · Verifica la integridad del respaldo (archivos presentes y hashes).
- *   2 · Limpia y recrea el esquema `public` en la instancia de restauración.
- *   3 · Aplica las migraciones del repo en la instancia de restauración.
- *   4 · Crea la cuenta de la muestra en el destino con la contraseña del
+ *   1 · Verifica la integridad del respaldo (archivos presentes, tamaños y
+ *       hashes) y que no haya archivos que el manifiesto no declare.
+ *   2 · Prepara la instancia de restauración.
+ *   3 · Aplica `public.sql` en una base de datos de prueba del destino y
+ *       comprueba que reproduce los conteos por tabla del manifiesto.
+ *   4 · Limpia y recrea el esquema `public` en la instancia de restauración.
+ *   5 · Aplica las migraciones del repo en la instancia de restauración.
+ *   6 · Crea la cuenta de la muestra en el destino con la contraseña del
  *       manifiesto (los hashes de contraseña no migran entre instancias).
- *   5 · Restaura las filas de la muestra desde el manifiesto.
- *   6 · Restaura los objetos del bucket `whatsapp-media` desde disco.
- *   7 · Verifica identidad, permisos, relación cuenta↔chat, historial y bytes
+ *   7 · Restaura las filas de la muestra desde el manifiesto.
+ *   8 · Restaura los objetos del bucket `whatsapp-media` desde disco.
+ *   9 · Verifica identidad, permisos, relación cuenta↔chat, historial y bytes
  *       del adjunto usando los route handlers reales en proceso.
- *   8 · Registra el resultado fuera de la base.
+ *  10 · Registra el resultado fuera de la base.
  *
  *   cd apps/api && pnpm exec tsx scripts/restore-rehearsal.ts --backup <dir>
  */
 import 'dotenv/config'
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, appendFileSync, existsSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, appendFileSync, chmodSync, existsSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
+import { createHash } from 'node:crypto'
 import { Client } from 'pg'
 import { createClient } from '@supabase/supabase-js'
-import { verifyBackupIntegrity, type BackupManifest } from '../src/lib/backup-integrity'
+import {
+  verifyBackupIntegrity,
+  resolveBackupFilePath,
+  type BackupManifest,
+  type BackupExternalDependency,
+} from '../src/lib/backup-integrity'
 
 const REPO = process.cwd().endsWith('apps/api') ? process.cwd() : join(process.cwd(), 'apps/api')
 const REPO_ROOT = join(REPO, '..', '..')
 const RESTORE_STACK_DIR =
   process.env.RESTORE_STACK_DIR ?? join(homedir(), 'supabase-dev/onano-support-restore')
-const BACKUP_DIR = process.env.BACKUP_DIR ?? join(homedir(), 'supabase-dev/backups')
-const REGISTRY = join(BACKUP_DIR, 'registry.jsonl')
+/** Directorio donde viven los respaldos y el registro de los ensayos. */
+const BACKUPS_DIR = process.env.BACKUPS_DIR ?? join(homedir(), 'supabase-dev/backups')
+const REGISTRY = join(BACKUPS_DIR, 'registry.jsonl')
+
+/** Base de datos de prueba donde se aplica el volcado para contrastarlo. */
+const SCRATCH_DB = 'backup_check'
 
 function sh(cmd: string, args: string[], opts: { cwd?: string; quiet?: boolean } = {}): string {
   const out = execFileSync(cmd, args, {
@@ -66,9 +80,21 @@ function actor(): string {
   }
 }
 
-function register(entry: Record<string, unknown>) {
-  mkdirSync(BACKUP_DIR, { recursive: true })
-  appendFileSync(REGISTRY, JSON.stringify(entry) + '\n')
+/**
+ * El registro es la evidencia de que el ensayo corrió: un fallo al
+ * escribirlo NUNCA puede tapar el fallo que lo provocó.
+ */
+function register(entry: Record<string, unknown>): void {
+  try {
+    mkdirSync(BACKUPS_DIR, { recursive: true })
+    appendFileSync(REGISTRY, JSON.stringify(entry) + '\n')
+    // El registro nombra la cuenta de la muestra: no es público.
+    chmodSync(REGISTRY, 0o600)
+  } catch (e) {
+    console.error(
+      `AVISO: no se pudo escribir el registro ${REGISTRY}: ${(e as Error).message}`,
+    )
+  }
 }
 
 // Directorio temporal de trabajo: si el ensayo falla a media restauracion, no
@@ -92,7 +118,11 @@ function fail(step: string, detail: string): never {
   process.exit(1)
 }
 
-async function sql<T = unknown>(connectionString: string, text: string): Promise<T[]> {
+/**
+ * TLS: el Postgres local de Supabase NO lo soporta. Fuera de loopback el
+ * certificado se verifica: nadie puede suplantar el servidor del destino.
+ */
+function sslFor(connectionString: string): false | { rejectUnauthorized: boolean } {
   const host = (() => {
     try {
       return new URL(connectionString).hostname
@@ -100,10 +130,14 @@ async function sql<T = unknown>(connectionString: string, text: string): Promise
       return ''
     }
   })()
-  const local = ['127.0.0.1', 'localhost', '::1'].includes(host)
+  if (['127.0.0.1', 'localhost', '::1', '0.0.0.0'].includes(host)) return false
+  return { rejectUnauthorized: true }
+}
+
+async function sql<T = unknown>(connectionString: string, text: string): Promise<T[]> {
   const pg = new Client({
     connectionString,
-    ssl: local ? false : { rejectUnauthorized: false },
+    ssl: sslFor(connectionString),
   })
   await pg.connect()
   try {
@@ -111,6 +145,292 @@ async function sql<T = unknown>(connectionString: string, text: string): Promise
     return res.rows as T[]
   } finally {
     await pg.end()
+  }
+}
+
+// ---------------------------------------------------------------- psql
+
+interface PsqlTarget {
+  url: string
+  host: string
+  port: string
+  user: string
+  database: string
+  password: string
+}
+
+const PSQL_BIN = existsSync('/opt/homebrew/opt/libpq/bin/psql')
+  ? '/opt/homebrew/opt/libpq/bin/psql'
+  : 'psql'
+
+function psqlTarget(dbUrl: string, database?: string): PsqlTarget {
+  const url = new URL(dbUrl)
+  const db = database ?? decodeURIComponent(url.pathname.replace(/^\//, '') || 'postgres')
+  const withDatabase = new URL(dbUrl)
+  withDatabase.pathname = `/${db}`
+  return {
+    url: withDatabase.toString(),
+    host: url.hostname,
+    // El puerto SIEMPRE viaja explícito: el `psql` del sistema (el de CI)
+    // se conecta al 5432 por omisión y el destino vive en otro puerto.
+    port: url.port || '5432',
+    user: decodeURIComponent(url.username || 'postgres'),
+    database: db,
+    password: decodeURIComponent(url.password || ''),
+  }
+}
+
+/**
+ * El cliente de Homebrew acepta la URL completa; el `psql` del sistema no, y
+ * necesita host, puerto, usuario y base por separado.
+ */
+function psqlCommand(target: PsqlTarget, extra: string[]): { bin: string; args: string[] } {
+  if (PSQL_BIN.includes('libpq')) {
+    return { bin: PSQL_BIN, args: [target.url, ...extra] }
+  }
+  return {
+    bin: 'psql',
+    args: [
+      '-h',
+      target.host,
+      '-p',
+      target.port,
+      '-U',
+      target.user,
+      '-d',
+      target.database,
+      ...extra,
+    ],
+  }
+}
+
+function runPsql(target: PsqlTarget, extra: string[]): string {
+  const { bin, args } = psqlCommand(target, extra)
+  if (!bin.includes('libpq')) {
+    process.env.PGPASSWORD = target.password
+  }
+  return sh(bin, args, { quiet: true })
+}
+
+// ---------------------------------------------------------------- volcado
+
+/**
+ * El volcado del esquema `public` NO incluye las extensiones (son objetos de
+ * base, no de esquema) y su `CREATE SCHEMA public;` exige que el esquema
+ * todavía no exista. Por eso el volcado se aplica en dos tramos: el primero
+ * crea el esquema y las tablas, y entre los dos se declara lo que el
+ * manifiesto dice que hace falta (sin `pg_trgm`, el índice `gin_trgm_ops` no
+ * se crea).
+ *
+ * El contenido aplicado es el volcado VERBATIM: entre los tramos solo se
+ * intercala la declaración de las extensiones.
+ */
+function partirVolcado(dump: Buffer): { primera: Buffer; segunda: Buffer } {
+  const texto = dump.toString('utf8')
+  const match = /^CREATE (?:UNIQUE )?INDEX /m.exec(texto)
+  if (!match || match.index === undefined) return { primera: dump, segunda: Buffer.alloc(0) }
+  const corte = Buffer.byteLength(texto.slice(0, match.index), 'utf8')
+  return { primera: dump.subarray(0, corte), segunda: dump.subarray(corte) }
+}
+
+function agruparPorTabla(
+  dependencias: BackupExternalDependency[],
+): Map<string, BackupExternalDependency[]> {
+  const grupos = new Map<string, BackupExternalDependency[]>()
+  for (const dependencia of dependencias) {
+    const clave = `${dependencia.schema}.${dependencia.table}`
+    const lista = grupos.get(clave) ?? []
+    lista.push(dependencia)
+    grupos.set(clave, lista)
+  }
+  return grupos
+}
+
+/**
+ * Objetos fuera de `public` de los que depende el esquema volcado (en
+ * Supabase, `auth.users` lo administra GoTrue y NO está en el respaldo).
+ *
+ * Se crean tablas con la forma que las claves foráneas necesitan: sin ellas
+ * el volcado no se puede aplicar en una base limpia.
+ */
+function ddlDependenciasExternas(manifest: BackupManifest): string {
+  const dependencias = manifest.externalDependencies ?? []
+  if (dependencias.length === 0) return ''
+
+  const lineas = ['-- Objetos fuera de `public` de los que depende el esquema volcado.']
+  for (const [, lista] of agruparPorTabla(dependencias)) {
+    const primera = lista[0]
+    const columnas = lista.map((d) => `"${d.column}" ${d.type}`).join(', ')
+    const clave = lista.map((d) => `"${d.column}"`).join(', ')
+    lineas.push(`CREATE SCHEMA IF NOT EXISTS "${primera.schema}";`)
+    lineas.push(
+      `CREATE TABLE IF NOT EXISTS "${primera.schema}"."${primera.table}" (${columnas}, PRIMARY KEY (${clave}));`,
+    )
+  }
+  // Mientras se cargan los datos, las claves foráneas no se validan: las filas
+  // referenciadas viven fuera del respaldo y se dan de alta después.
+  lineas.push('SET session_replication_role = replica;')
+  return lineas.join('\n') + '\n'
+}
+
+/**
+ * Da de alta en las tablas referenciadas las filas que el propio volcado
+ * declara en `public`, para que la clave foránea pueda validarse al
+ * crearse.
+ */
+function ddlPobladoDependencias(manifest: BackupManifest): string {
+  const dependencias = manifest.externalDependencies ?? []
+  if (dependencias.length === 0) return ''
+
+  const lineas = [
+    '-- Las filas que el volcado declara en `public` también existen en las tablas que referencia.',
+  ]
+  for (const [, lista] of agruparPorTabla(dependencias)) {
+    const primera = lista[0]
+    const destino = lista.map((d) => `"${d.column}"`).join(', ')
+    const origen = lista
+      .map(
+        (d) =>
+          `select distinct t."${d.fromColumn}" as v from "${d.fromSchema}"."${d.fromTable}" t where t."${d.fromColumn}" is not null`,
+      )
+      .join(' union all ')
+    lineas.push(
+      `insert into "${primera.schema}"."${primera.table}" (${destino}) select v from (${origen}) s where v is not null on conflict do nothing;`,
+    )
+  }
+  return lineas.join('\n') + '\n'
+}
+
+function ddlExtensiones(manifest: BackupManifest): string {
+  const extensiones = manifest.extensions ?? []
+  const lineas = ['-- Extensiones que el esquema público necesita (no vienen en el volcado).']
+  lineas.push('CREATE SCHEMA IF NOT EXISTS public;')
+  // El volcado deja el `search_path` vacío; sin un esquema donde crear, la
+  // extensión no se puede instalar.
+  lineas.push('SET search_path = public;')
+  for (const extension of extensiones) {
+    const identificador = `"${extension.replace(/"/g, '""')}"`
+    // Sin SCHEMA explícito: hay extensiones que viven en su propio esquema
+    // (`supabase_vault` exige `vault`) y no se pueden mover.
+    lineas.push(`CREATE EXTENSION IF NOT EXISTS ${identificador};`)
+  }
+  // Se devuelve el `search_path` vacío que el volcado usa para que sus
+  // nombres sin calificar se resuelvan contra pg_catalog.
+  lineas.push("SELECT pg_catalog.set_config('search_path', '', false);")
+  return lineas.join('\n') + '\n'
+}
+
+/**
+ * Aplica `public.sql` en una base de datos de prueba del Postgres de destino
+ * y compara los conteos por tabla con los del manifiesto.
+ *
+ * Devuelve `null` cuando todo cuadra, o el mensaje del problema. La base de
+ * prueba se borra SIEMPRE, incluso cuando la comparación falla.
+ */
+async function verificarVolcadoEnScratch(
+  dbUrl: string,
+  manifest: BackupManifest,
+  backupDir: string,
+  workDir: string,
+): Promise<string | null> {
+  const dumpPath = join(backupDir, 'public.sql')
+  if (!existsSync(dumpPath)) return `no existe el volcado ${dumpPath}`
+  if (!manifest.tableCounts || manifest.tableCounts.length === 0) {
+    return 'el manifiesto no declara los conteos por tabla del volcado'
+  }
+
+  const dump = readFileSync(dumpPath)
+  const { primera, segunda } = partirVolcado(dump)
+  const aplicado = Buffer.concat([primera, segunda])
+  const esperado = manifest.files.find((f) => f.path === 'public.sql')
+  if (esperado) {
+    const hash = createHash('sha256').update(aplicado).digest('hex')
+    if (hash !== esperado.sha256) {
+      return `el volcado aplicado no es el archivo verificado (sha256 ${hash} != ${esperado.sha256})`
+    }
+  }
+
+  const applyPath = join(workDir, 'apply-dump.sql')
+  // El volcado se aplica VERBATIM: lo único que se intercala es la
+  // preparación de la base de prueba (las tablas de las que dependen las
+  // claves foráneas, las extensiones y el alta de las filas referenciadas).
+  const puntoInicial = ddlDependenciasExternas(manifest)
+  const puntoMedio = [
+    'SET session_replication_role = origin;',
+    ddlExtensiones(manifest),
+    ddlPobladoDependencias(manifest),
+  ].join('\n')
+  writeFileSync(
+    applyPath,
+    Buffer.concat([
+      Buffer.from(puntoInicial, 'utf8'),
+      primera,
+      Buffer.from(puntoMedio, 'utf8'),
+      segunda,
+    ]),
+  )
+
+  const destino = psqlTarget(dbUrl)
+  const scratch = psqlTarget(dbUrl, SCRATCH_DB)
+
+  try {
+    runPsql(destino, ['-v', 'ON_ERROR_STOP=1', '-c', `drop database if exists ${SCRATCH_DB}`])
+    runPsql(destino, ['-v', 'ON_ERROR_STOP=1', '-c', `create database ${SCRATCH_DB}`])
+    // El esquema `public` tiene que NO existir: el volcado lo crea.
+    runPsql(scratch, ['-v', 'ON_ERROR_STOP=1', '-c', 'drop schema if exists public cascade'])
+
+    try {
+      runPsql(scratch, ['-v', 'ON_ERROR_STOP=1', '-f', applyPath])
+    } catch (e) {
+      const salida = `${(e as { stdout?: string }).stdout ?? ''}${(e as { stderr?: string }).stderr ?? ''}`
+      return `el volcado no se pudo aplicar en la base de prueba: ${salida.trim().slice(-600)}`
+    }
+
+    const tablas = await sql<{ table_name: string }>(
+      scratch.url,
+      `select table_name from information_schema.tables
+        where table_schema = 'public' and table_type = 'BASE TABLE'
+        order by table_name`,
+    )
+    const encontrados = new Map<string, number>()
+    for (const tabla of tablas) {
+      const identificador = `"${tabla.table_name.replace(/"/g, '""')}"`
+      const contados = await sql<{ total: string }>(
+        scratch.url,
+        `select count(*)::text as total from public.${identificador}`,
+      )
+      encontrados.set(tabla.table_name, Number(contados[0]?.total ?? 0))
+    }
+
+    const diferencias: string[] = []
+    for (const conteo of manifest.tableCounts) {
+      if (!encontrados.has(conteo.table)) {
+        diferencias.push(`${conteo.table}: no existe en la base de prueba`)
+        continue
+      }
+      const filas = encontrados.get(conteo.table)
+      if (filas !== conteo.rows) {
+        diferencias.push(`${conteo.table}: ${filas} filas en el volcado, ${conteo.rows} en el manifiesto`)
+      }
+    }
+    for (const [tabla, filas] of encontrados) {
+      if (!manifest.tableCounts.some((c) => c.table === tabla)) {
+        diferencias.push(`${tabla}: ${filas} filas en el volcado y no está en el manifiesto`)
+      }
+    }
+    if (diferencias.length > 0) {
+      return `el volcado no reproduce los conteos del manifiesto: ${diferencias.join('; ')}`
+    }
+    return null
+  } catch (e) {
+    return `no se pudo preparar la base de prueba: ${(e as Error).message}`
+  } finally {
+    try {
+      runPsql(destino, ['-v', 'ON_ERROR_STOP=1', '-c', `drop database if exists ${SCRATCH_DB}`])
+    } catch {
+      // La base de prueba se limpia en cualquier caso; si no se pudo, el
+      // ensayo ya falló por otra razón y el nombre queda documentado arriba.
+    }
   }
 }
 
@@ -145,11 +465,13 @@ async function callRoute<TContext>(
 function parseArgs(): { backupDir: string } {
   const args = process.argv.slice(2)
   const idx = args.indexOf('--backup')
-  if (idx === -1 || !args[idx + 1]) {
+  const fromCli = idx !== -1 ? args[idx + 1] : undefined
+  const backupDir = fromCli ?? process.env.BACKUP_DIR
+  if (!backupDir) {
     console.error('Uso: pnpm exec tsx scripts/restore-rehearsal.ts --backup <directorio>')
     process.exit(2)
   }
-  return { backupDir: args[idx + 1] }
+  return { backupDir }
 }
 
 async function main() {
@@ -164,21 +486,35 @@ async function main() {
   } catch (e) {
     fail('argumentos', `el manifiesto no es JSON valido: ${(e as Error).message}`)
   }
-  mkdirSync(BACKUP_DIR, { recursive: true })
+  mkdirSync(BACKUPS_DIR, { recursive: true })
 
   // ---------------------------------------------------------------- 1 · integridad
   console.log('== 1 · integridad del respaldo ==')
   const integrity = verifyBackupIntegrity(backupDir, manifest)
   if (!integrity.ok) fail('integridad', integrity.error)
-  console.log('   archivos presentes y hashes correctos')
+  console.log('   archivos presentes, con el tamaño y los hashes correctos')
+
+  const workDir = mkdtempSync(join(tmpdir(), 'crm-restore-'))
+  WORK_DIR = workDir
 
   // ---------------------------------------------------------------- 2 · instancia de restauración
   console.log('== 2 · instancia de restauración ==')
   const restoreEnv = prepareRestoreStack()
   console.log(`   API=${restoreEnv.apiUrl} DB=${restoreEnv.dbUrl}`)
 
-  // ---------------------------------------------------------------- 3 · estado limpio
-  console.log('== 3 · estado limpio del destino ==')
+  // ---------------------------------------------------------------- 3 · el volcado sirve
+  console.log('== 3 · el volcado se aplica y reproduce los conteos ==')
+  const problemaVolcado = await verificarVolcadoEnScratch(
+    restoreEnv.dbUrl,
+    manifest,
+    backupDir,
+    workDir,
+  )
+  if (problemaVolcado) fail('volcado', problemaVolcado)
+  console.log(`   tablas comprobadas: ${manifest.tableCounts?.length ?? 0}`)
+
+  // ---------------------------------------------------------------- 4 · estado limpio
+  console.log('== 4 · estado limpio del destino ==')
   try {
     await sql(restoreEnv.dbUrl, 'drop schema public cascade; create schema public;')
   } catch (e) {
@@ -203,8 +539,8 @@ async function main() {
   }
   console.log('   esquema public recreado y privilegios por defecto aplicados')
 
-  // ---------------------------------------------------------------- 4 · migraciones
-  console.log('== 4 · migraciones del repo en la instancia restaurada ==')
+  // ---------------------------------------------------------------- 5 · migraciones
+  console.log('== 5 · migraciones del repo en la instancia restaurada ==')
   const migrateEnv = {
     ...process.env,
     DATABASE_URL: restoreEnv.dbUrl,
@@ -233,8 +569,8 @@ async function main() {
   }
   console.log(`   migraciones aplicadas: ${restoredLedger.length}`)
 
-  // ---------------------------------------------------------------- 5 · restaurar muestra
-  console.log('== 5 · restauración de la muestra ==')
+  // ---------------------------------------------------------------- 6 · restaurar muestra
+  console.log('== 6 · restauración de la muestra ==')
   const rest = createClient(restoreEnv.apiUrl, restoreEnv.secretKey, {
     auth: { persistSession: false },
   })
@@ -255,8 +591,6 @@ async function main() {
 
   // El SQL de la muestra se escribe FUERA del respaldo: el directorio del
   // respaldo es la fuente y no se toca (su integridad está verificada).
-  const workDir = mkdtempSync(join(tmpdir(), 'crm-restore-'))
-  WORK_DIR = workDir
   const sampleSqlPath = join(workDir, 'restore-sample.sql')
   writeFileSync(
     sampleSqlPath,
@@ -270,66 +604,35 @@ async function main() {
     ].join('\n'),
   )
 
-  const psql = existsSync('/opt/homebrew/opt/libpq/bin/psql')
-    ? '/opt/homebrew/opt/libpq/bin/psql'
-    : 'psql'
-  if (!psql.includes('libpq')) {
-    const url = new URL(restoreEnv.dbUrl)
-    process.env.PGPASSWORD = decodeURIComponent(url.password ?? '')
-  }
-  const psqlArgs = psql.includes('libpq')
-    ? [restoreEnv.dbUrl, '-v', 'ON_ERROR_STOP=1', '-f', sampleSqlPath]
-    : [
-        '-h',
-        new URL(restoreEnv.dbUrl).hostname,
-        '-U',
-        'postgres',
-        '-d',
-        'postgres',
-        '-v',
-        'ON_ERROR_STOP=1',
-        '-f',
-        sampleSqlPath,
-      ]
   try {
-    sh(psql, psqlArgs, { quiet: true })
+    runPsql(psqlTarget(restoreEnv.dbUrl), ['-v', 'ON_ERROR_STOP=1', '-f', sampleSqlPath])
   } catch (e) {
     const out = `${(e as { stdout?: string }).stdout ?? ''}${(e as { stderr?: string }).stderr ?? ''}`
     fail('restauración', `la muestra no se restauró: ${out.slice(-800)}`)
   }
 
-  // ---------------------------------------------------------------- 6 · objetos de Storage
-  console.log('== 6 · objetos de Storage desde disco ==')
-  const storageDir = join(backupDir, 'storage')
-  if (existsSync(storageDir)) {
-    const { readdirSync, statSync } = await import('node:fs')
-    const walk = (dir: string): string[] => {
-      const out: string[] = []
-      for (const entry of readdirSync(dir)) {
-        const full = join(dir, entry)
-        if (statSync(full).isDirectory()) {
-          out.push(...walk(full))
-        } else {
-          out.push(full)
-        }
-      }
-      return out
-    }
-    const files = walk(storageDir)
-    for (const fullPath of files) {
-      const objectName = fullPath.slice(storageDir.length + 1)
-      const bytes = readFileSync(fullPath)
-      const { error: upErr } = await rest.storage
-        .from('whatsapp-media')
-        .upload(objectName, bytes, { contentType: 'text/plain', upsert: true })
-      if (upErr) fail('storage', `no se pudo subir ${objectName}: ${upErr.message}`)
-      console.log(`   ${objectName} (${bytes.length} bytes)`)
-    }
-    if (files.length === 0) console.log('   (sin objetos)')
+  // ---------------------------------------------------------------- 7 · objetos de Storage
+  console.log('== 7 · objetos de Storage desde disco ==')
+  // Solo los objetos que el manifiesto declara: la verificación de integridad
+  // ya rechazó que haya archivos extra, así que aquí no puede subirse nada
+  // que nadie haya verificado.
+  const objetos = manifest.files.filter((f) => f.path.startsWith('storage/'))
+  for (const entry of objetos) {
+    const objectName = entry.path.slice('storage/'.length)
+    const fullPath = resolveBackupFilePath(backupDir, entry.path)
+    if (!fullPath) fail('storage', `ruta de objeto inválida en el manifiesto: ${entry.path}`)
+    const bytes = readFileSync(fullPath)
+    const contentType = entry.contentType ?? 'application/octet-stream'
+    const { error: upErr } = await rest.storage
+      .from('whatsapp-media')
+      .upload(objectName, bytes, { contentType, upsert: true })
+    if (upErr) fail('storage', `no se pudo subir ${objectName}: ${upErr.message}`)
+    console.log(`   ${objectName} (${bytes.length} bytes, ${contentType})`)
   }
+  if (objetos.length === 0) console.log('   (sin objetos)')
 
-  // ---------------------------------------------------------------- 7 · verificación
-  console.log('== 7 · verificación en la instancia restaurada ==')
+  // ---------------------------------------------------------------- 8 · verificación
+  console.log('== 8 · verificación en la instancia restaurada ==')
   const browser = createClient(restoreEnv.apiUrl, restoreEnv.publishableKey, {
     auth: { persistSession: false },
   })
@@ -350,7 +653,7 @@ async function main() {
   const meRoute = await import('../src/app/api/me/route')
   const conversationRoute = await import('../src/app/api/conversations/[id]/route')
 
-  // 7.1 · identidad + permisos
+  // 8.1 · identidad + permisos
   const me = await callRoute<undefined>(meRoute.GET, '/api/me', token, undefined)
   if (me.status !== 200) {
     fail('verificación', `/api/me respondió ${me.status} en la copia`)
@@ -360,7 +663,7 @@ async function main() {
     fail('verificación', 'la copia devolvió un keyring vacío: los permisos no se restauraron')
   }
 
-  // 7.2 · relación cuenta↔chat y contacto
+  // 8.2 · relación cuenta↔chat y contacto
   const { data: chatRow, error: chatErr } = await rest
     .from('conversations')
     .select('id, contact_id, assigned_agent_id')
@@ -376,7 +679,7 @@ async function main() {
     fail('verificación', 'el chat no apunta al contacto restaurado')
   }
 
-  // 7.3 · historial del chat, servido y autorizado por la app
+  // 8.3 · historial del chat, servido y autorizado por la app
   const history = await callRoute(
     conversationRoute.GET,
     `/api/conversations/${manifest.conversation.id}`,
@@ -392,13 +695,15 @@ async function main() {
     fail('verificación', 'el historial del chat no se restauró')
   }
 
-  // 7.4 · bytes del adjunto de la muestra
+  // 8.4 · bytes del adjunto de la muestra
   const sampleFileEntry = manifest.files.find((f) => f.path === `storage/${manifest.attachment.path}`)
   if (!sampleFileEntry) {
     fail('verificación', `el manifiesto no incluye el adjunto de la muestra: ${manifest.attachment.path}`)
   }
   const objectName = sampleFileEntry.path.slice('storage/'.length)
-  const backupBytes = readFileSync(join(backupDir, sampleFileEntry.path))
+  const samplePath = resolveBackupFilePath(backupDir, sampleFileEntry.path)
+  if (!samplePath) fail('verificación', `ruta de adjunto inválida: ${sampleFileEntry.path}`)
+  const backupBytes = readFileSync(samplePath)
   const { data: back, error: backErr } = await rest.storage.from('whatsapp-media').download(objectName)
   if (backErr || !back) {
     fail('verificación', `no se pudo leer el archivo en la copia: ${backErr?.message ?? 'sin datos'}`)
@@ -411,7 +716,7 @@ async function main() {
     )
   }
 
-  // ---------------------------------------------------------------- 8 · registro
+  // ---------------------------------------------------------------- 9 · registro
   const record = {
     objetivo: 'ensayo de respaldo y restauración',
     destino: restoreEnv.apiUrl,
@@ -426,6 +731,8 @@ async function main() {
       bytes: sampleFileEntry.size,
     },
     verificado: [
+      'integridad del respaldo (tamaño y hash)',
+      'volcado aplicado y conteos por tabla',
       'inicio de sesión',
       'keyring de permisos',
       'relación cuenta-chat-contacto',
