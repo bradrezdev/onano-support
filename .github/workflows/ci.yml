@@ -138,6 +138,13 @@ jobs:
     name: E2E autenticado (instancia efímera) + E1
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # E3 · Recepción de WhatsApp. Son valores SINTÉTICOS: la suite de
+      # aceptación firma las peticiones con este token y sobre esta URL
+      # pública, que es la que el webhook reconstruye al validar. La
+      # credencial real de la cuenta de Twilio nunca vive en el CI.
+      TWILIO_AUTH_TOKEN: 'e2e-twilio-token-ci-9931'
+      WEBHOOK_BASE_URL: http://localhost:3000
 
     steps:
       - uses: actions/checkout@v4
@@ -259,8 +266,11 @@ jobs:
           pnpm --filter @crm/api exec tsx scripts/validate-access-controls.ts --strict 2>&1 | tee /tmp/access-controls.log
 
       # A control that did not run is a pending control: the job fails.
+      # Las DOS suites son obligatorias: la de autorización (PR #2) y la de
+      # recepción de WhatsApp (E3). Si alguna no aparece, se omite o se queda
+      # corta, el job falla.
       - name: Count access controls
-        run: node scripts/ci/count-access-controls.mjs /tmp/integration-results.json 32
+        run: node scripts/ci/count-access-controls.mjs /tmp/integration-results.json 32 7
 
       - name: E2E (Playwright, autenticado)
         env:
