@@ -9,10 +9,16 @@ import ConversationDetailPage from './ConversationDetailPage'
  * - Reassign sends assigned_agent_id + reason + expected_version.
  * - 409 version_conflict reloads the detail and shows a specific message.
  * - 409 assignment_changed on send keeps the draft, reloads detail, and does not append the message.
+ *
+ * And the evidence contract (S7, S8, S12):
+ * - A 403 withdraws the cached history of the chat from the screen.
+ * - The draft lives under a key that carries the agent AND the chat.
  */
 
+let currentConversationId = 'conv-1'
+
 vi.mock('react-router-dom', () => ({
-  useParams: vi.fn().mockReturnValue({ id: 'conv-1' }),
+  useParams: vi.fn(() => ({ id: currentConversationId })),
   Link: ({ children, ...props }: React.AnchorHTMLAttributes<HTMLAnchorElement>) => (
     <a {...props}>{children}</a>
   ),
@@ -91,14 +97,70 @@ const baseDetail = {
   },
 }
 
+const otherDetail = {
+  data: {
+    conversation: {
+      ...baseDetail.data.conversation,
+      id: 'conv-2',
+      contact: { id: 'contact-2', whatsapp_number: '+521234567891', name: 'María' },
+    },
+    messages: [
+      {
+        id: 'msg-9',
+        conversation_id: 'conv-2',
+        direction: 'in' as const,
+        body: 'Mensaje de otro cliente',
+        twilio_sid: null,
+        twilio_status: null,
+        sent_by_id: null,
+        created_at: new Date().toISOString(),
+      },
+    ],
+  },
+}
+
 const agents = {
   data: [{ id: 'agent-2', display_name: 'María', role: 'supervisor' as const }],
+}
+
+/**
+ * The jsdom environment of this repo has no localStorage: Node's own
+ * experimental `localStorage` global shadows jsdom's and answers undefined
+ * without `--localstorage-file`. The browser has one; the test installs an
+ * equivalent so the draft store can be observed.
+ */
+function installLocalStorage(): Storage {
+  const map = new Map<string, string>()
+  const storage = {
+    getItem: (k: string) => map.get(k) ?? null,
+    setItem: (k: string, v: string) => {
+      map.set(k, v)
+    },
+    removeItem: (k: string) => {
+      map.delete(k)
+    },
+    clear: () => {
+      map.clear()
+    },
+    key: (i: number) => Array.from(map.keys())[i] ?? null,
+    get length() {
+      return map.size
+    },
+  } as Storage
+  Object.defineProperty(globalThis, 'localStorage', {
+    value: storage,
+    configurable: true,
+    writable: true,
+  })
+  return storage
 }
 
 function setupGets() {
   mockedApi.get.mockImplementation((path: string) => {
     if (path === '/api/conversations/conv-1') return Promise.resolve(baseDetail)
+    if (path === '/api/conversations/conv-2') return Promise.resolve(otherDetail)
     if (path === '/api/conversations/conv-1/tickets') return Promise.resolve({ data: [] })
+    if (path === '/api/conversations/conv-2/tickets') return Promise.resolve({ data: [] })
     if (path === '/api/users/assignable') return Promise.resolve(agents)
     return Promise.reject(new Error(`Unexpected GET ${path}`))
   })
@@ -111,12 +173,20 @@ beforeEach(() => {
   mockedApi.post.mockReset()
   mockedApi.del.mockReset()
   store.profile = adminProfile
+  currentConversationId = 'conv-1'
+  installLocalStorage()
+  localStorage.clear()
 })
 
 async function renderLoaded() {
   setupGets()
-  render(<ConversationDetailPage />)
+  const view = render(<ConversationDetailPage />)
   await waitFor(() => expect(screen.getByText('Juan')).toBeTruthy())
+  return view
+}
+
+function draftBox(): HTMLTextAreaElement {
+  return screen.getByPlaceholderText('Escribe tu respuesta…') as HTMLTextAreaElement
 }
 
 describe('ConversationDetailPage — send', () => {
@@ -142,8 +212,7 @@ describe('ConversationDetailPage — send', () => {
   })
 })
 
-describe('ConversationDetailPage — reassign', () => {
-  it('does not call the API when the reason is empty and shows the reason warning', async () => {
+describe('ConversationDetailPage — reassign', () => {  it('does not call the API when the reason is empty and shows the reason warning', async () => {
     await renderLoaded()
 
     fireEvent.change(screen.getByLabelText('Reasignar conversación'), {
@@ -203,5 +272,120 @@ describe('ConversationDetailPage — reassign', () => {
     )
 
     expect(mockedApi.get).toHaveBeenCalledWith('/api/conversations/conv-1')
+  })
+})
+
+describe('ConversationDetailPage — borrador aislado por (agente, chat)', () => {
+  it('guarda el borrador con la clave del agente y del chat', async () => {
+    await renderLoaded()
+
+    fireEvent.change(draftBox(), { target: { value: 'Respuesta de prueba' } })
+
+    expect(localStorage.getItem('crm:draft:admin-1:conv-1')).toBe('Respuesta de prueba')
+  })
+
+  it('el borrador sobrevive a un recarga', async () => {
+    await renderLoaded()
+
+    fireEvent.change(draftBox(), { target: { value: 'Se queda' } })
+
+    cleanup()
+    setupGets()
+    render(<ConversationDetailPage />)
+
+    await waitFor(() => expect(draftBox().value).toBe('Se queda'))
+  })
+
+  it('otro chat no muestra el borrador del chat anterior', async () => {
+    const view = await renderLoaded()
+
+    fireEvent.change(draftBox(), { target: { value: 'Secreto de conv-1' } })
+
+    currentConversationId = 'conv-2'
+    view.rerender(<ConversationDetailPage />)
+
+    await waitFor(() => expect(screen.getByText('María')).toBeTruthy())
+    expect(draftBox().value).toBe('')
+    expect(localStorage.getItem('crm:draft:admin-1:conv-1')).toBe('Secreto de conv-1')
+  })
+
+  it('otro agente en la misma máquina no ve el borrador', async () => {
+    const view = await renderLoaded()
+
+    fireEvent.change(draftBox(), { target: { value: 'Secreto de agent-1' } })
+
+    store.profile = { ...adminProfile, id: 'agent-9' }
+    view.rerender(<ConversationDetailPage />)
+
+    await waitFor(() => expect(draftBox().value).toBe(''))
+    expect(localStorage.getItem('crm:draft:admin-1:conv-1')).toBe('Secreto de agent-1')
+    expect(localStorage.getItem('crm:draft:agent-9:conv-1')).toBeNull()
+  })
+
+  it('al enviar el mensaje el borrador se borra', async () => {
+    mockedApi.post.mockResolvedValue({
+      data: {
+        id: 'msg-2',
+        conversation_id: 'conv-1',
+        direction: 'out',
+        body: 'Respuesta de prueba',
+        twilio_sid: null,
+        twilio_status: null,
+        sent_by_id: null,
+        created_at: new Date().toISOString(),
+      },
+    })
+
+    await renderLoaded()
+
+    fireEvent.change(draftBox(), { target: { value: 'Respuesta de prueba' } })
+    fireEvent.click(screen.getByRole('button', { name: /enviar/i }))
+
+    await waitFor(() =>
+      expect(localStorage.getItem('crm:draft:admin-1:conv-1')).toBeNull(),
+    )
+    expect(draftBox().value).toBe('')
+  })
+})
+
+describe('ConversationDetailPage — 403 (ya no tienes acceso)', () => {
+  it('retira el historial y el borrador de la pantalla', async () => {
+    localStorage.setItem('crm:draft:admin-1:conv-1', 'Secreto del agente')
+    mockedApi.get.mockImplementation((path: string) => {
+      if (path === '/api/conversations/conv-1') {
+        return Promise.reject(new ApiError(403, 'forbidden', 'No tienes acceso'))
+      }
+      return Promise.resolve({ data: [] })
+    })
+
+    render(<ConversationDetailPage />)
+
+    await waitFor(() =>
+      expect(screen.getByText(/ya no tienes acceso a esta conversación/i)).toBeTruthy(),
+    )
+    expect(screen.queryByText('Hola')).toBeNull()
+    expect(screen.queryByPlaceholderText('Escribe tu respuesta…')).toBeNull()
+    expect(localStorage.getItem('crm:draft:admin-1:conv-1')).toBeNull()
+  })
+
+  it('un 403 en un chat no impide abrir otro chat', async () => {
+    mockedApi.get.mockImplementation((path: string) => {
+      if (path === '/api/conversations/conv-1') {
+        return Promise.reject(new ApiError(403, 'forbidden', 'No tienes acceso'))
+      }
+      if (path === '/api/conversations/conv-2') return Promise.resolve(otherDetail)
+      return Promise.resolve({ data: [] })
+    })
+
+    const view = render(<ConversationDetailPage />)
+    await waitFor(() =>
+      expect(screen.getByText(/ya no tienes acceso a esta conversación/i)).toBeTruthy(),
+    )
+
+    currentConversationId = 'conv-2'
+    view.rerender(<ConversationDetailPage />)
+
+    await waitFor(() => expect(screen.getByText('María')).toBeTruthy())
+    expect(screen.queryByText(/ya no tienes acceso a esta conversación/i)).toBeNull()
   })
 })

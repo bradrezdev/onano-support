@@ -74,4 +74,63 @@ export const api = {
   put: <T>(path: string, json?: unknown) => apiFetch<T>(path, { method: 'PUT', json }),
   patch: <T>(path: string, json?: unknown) => apiFetch<T>(path, { method: 'PATCH', json }),
   del: <T>(path: string) => apiFetch<T>(path, { method: 'DELETE' }),
+  /** Binary response (an attachment): bytes + the headers that describe them. */
+  getRaw: (path: string) => apiFetchRaw(path),
+}
+
+/**
+ * A binary response: the bytes plus the headers the API used to describe them.
+ *
+ * The API serves the attachment itself (not a signed URL that outlives the
+ * permission), so the browser has to carry the Bearer token on every single
+ * request and the API re-checks the authorization each time.
+ */
+export interface RawFile {
+  blob: Blob
+  contentType: string
+  contentDisposition: string | null
+}
+
+/**
+ * Fetches raw bytes through the same client (same token, same error shape).
+ *
+ * `api.get` is untouched: it parses JSON, which is what every other caller
+ * wants. This one hands the body over untouched.
+ */
+export async function apiFetchRaw(
+  path: string,
+  init: RequestInit = {},
+): Promise<RawFile> {
+  const url = path.startsWith('http') ? path : `${BASE}${path}`
+  const { headers, ...rest } = init
+  const auth = await authHeader()
+
+  const res = await fetch(url, {
+    ...rest,
+    headers: {
+      ...auth,
+      ...(headers as Record<string, string> | undefined),
+    },
+  })
+
+  if (!res.ok) {
+    type ErrorBody = { code?: string; message?: string }
+    let body: ErrorBody | null = null
+    try {
+      body = (await res.json()) as ErrorBody
+    } catch {
+      // ignore parse errors
+    }
+    throw new ApiError(
+      res.status,
+      body?.code ?? 'unknown',
+      body?.message ?? `HTTP ${res.status}`,
+    )
+  }
+
+  return {
+    blob: await res.blob(),
+    contentType: res.headers.get('content-type') ?? 'application/octet-stream',
+    contentDisposition: res.headers.get('content-disposition'),
+  }
 }
