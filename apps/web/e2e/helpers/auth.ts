@@ -15,12 +15,15 @@ export async function signIn(page: Page, email: string, password: string) {
 }
 
 export const test = base.extend({
-  signedInPage: async ({ page }, use, testInfo) => {
+  // The fixture callback is deliberately NOT named `use` (nor anything starting
+  // with "use"): the linter reads such a name as a React hook, and this file
+  // is not a React component (oxlint: react-hooks/rules-of-hooks).
+  signedInPage: async ({ page }, provide) => {
     const email = process.env.E2E_EMAIL
     const password = process.env.E2E_PASSWORD
     test.skip(!email || !password, 'E2E_EMAIL/E2E_PASSWORD not set — skipping protected route')
     await signIn(page, email!, password!)
-    await use(page)
+    await provide(page)
   },
 })
 

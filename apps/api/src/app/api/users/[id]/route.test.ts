@@ -47,6 +47,7 @@ class QueryMock {
 
 const mockAdmin: any = {
   from: vi.fn((): QueryMock => new QueryMock()),
+  rpc: vi.fn(),
   auth: {
     admin: {
       listUsers: vi.fn(),
@@ -66,6 +67,8 @@ beforeEach(() => {
   mockRequireUser.mockReset()
   mockRequirePermission.mockReset()
   mockAdmin.from.mockReset()
+  mockAdmin.rpc.mockReset()
+  mockAdmin.rpc.mockResolvedValue({ data: null, error: null })
   mockAdmin.auth.admin.listUsers.mockReset()
   mockAdmin.auth.admin.getUserById.mockReset()
 })
@@ -370,13 +373,10 @@ describe('PATCH /api/users/[id] — happy path', () => {
     okAuth('admin', 'u-actor') // different from u-target
     const before = { ...makeUserPayload('soporte'), role_key: 'soporte' }
     setupFindUser(before)
-    // Role lookup first (R2), then the update.
+    // Role lookup first (R2), then the transactional write.
     const roleQ = new QueryMock()
     roleQ.payload = { data: { key: 'admin', is_system: true }, error: null }
     mockAdmin.from.mockReturnValueOnce(roleQ)
-    const updateQ = new QueryMock()
-    updateQ.payload = { data: null, error: null }
-    mockAdmin.from.mockReturnValueOnce(updateQ)
 
     const res = await PATCH(
       new Request('http://x/api/users/u-target', {
@@ -389,8 +389,11 @@ describe('PATCH /api/users/[id] — happy path', () => {
     expect(res.status).toBe(200)
     const body = (await res.json()) as { data: { role: string } }
     expect(body.data.role).toBe('admin')
-    const updateRow = updateQ.ops.find((o) => o.op === 'update')!.args[0] as Record<string, unknown>
-    expect(updateRow.role).toBe('admin')
+    // The change and its audit entry travel in one call.
+    expect(mockAdmin.rpc).toHaveBeenCalledWith(
+      'admin_update_profile',
+      expect.objectContaining({ p_profile_id: 'u-target', p_role_key: 'admin' }),
+    )
   })
 })
 

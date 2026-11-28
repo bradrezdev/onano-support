@@ -5,30 +5,299 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Manual run: lets a branch be verified before it is proposed to main.
+  # `controlled_failure` injects a deliberate failure to prove that the
+  # matching gate turns RED (the closing criterion of E1).
+  workflow_dispatch:
+    inputs:
+      controlled_failure:
+        description: 'Inyecta un fallo controlado (unit|lint|build|e2e|none)'
+        type: choice
+        default: 'none'
+        options:
+          - none
+          - unit
+          - lint
+          - build
+          - e2e
+
+# Least privilege: this workflow only reads the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  E2E_API_URL: http://localhost:3000
+  E2E_READ_DEADLINE_MS: '90000'
 
 jobs:
-  test:
-    name: pnpm install + typecheck + test
+  verify:
+    name: install + typegen + typecheck + test + lint + build
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # pnpm version comes from packageManager (pnpm@11.22.0) in package.json.
+      # Passing `version:` here as well makes the action refuse with
+      # "Multiple versions of pnpm specified" — that alone failed every run.
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: CI=true pnpm install --frozen-lockfile
+
+      # Route/layout type definitions must exist before tsc: apps/api uses the
+      # generated `LayoutProps` global, which only exists after `next typegen`
+      # (or a build). On a clean checkout, typecheck without this step fails
+      # with TS2304: Cannot find name 'LayoutProps'.
+      - name: Generate API route types
+        run: pnpm --filter @crm/api typegen
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      # Every step below keeps the ORIGINAL exit code: piping into `tee`
+      # would otherwise hide it, and a gate that cannot report why it failed
+      # is a gate nobody trusts.
+      - name: Unit tests
+        run: |
+          set +e
+          pnpm test 2>&1 | tee /tmp/unit-tests.log
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "exit_unit_tests=${code}" >> "$GITHUB_ENV"
+          if [ "${{ inputs.controlled_failure }}" = "unit" ]; then
+            echo "::error::FALLO CONTROLADO INYECTADO (paso: pruebas unitarias)"
+            exit 1
+          fi
+          exit "${code}"
+
+      # Blocking gate: oxlint fails on ERRORS (it does not count warnings as
+      # failures — the web app carries 24 pre-existing warnings that are
+      # published in the summary below). It must never be silently ignored.
+      - name: Lint (web)
+        run: |
+          set +e
+          pnpm --filter @crm/web lint 2>&1 | tee /tmp/web-lint.log
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "exit_lint=${code}" >> "$GITHUB_ENV"
+          if [ "${{ inputs.controlled_failure }}" = "lint" ]; then
+            echo "::error::FALLO CONTROLADO INYECTADO (paso: lint)"
+            exit 1
+          fi
+          exit "${code}"
+
+      - name: Build
+        run: |
+          set +e
+          pnpm build 2>&1 | tee /tmp/build.log
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "exit_build=${code}" >> "$GITHUB_ENV"
+          if [ "${{ inputs.controlled_failure }}" = "build" ]; then
+            echo "::error::FALLO CONTROLADO INYECTADO (paso: build)"
+            exit 1
+          fi
+          exit "${code}"
+
+      - name: Verification summary
+        if: always()
+        run: |
+          {
+            echo "### Verification summary"
+            echo ""
+            echo "**Unit tests (vitest)**"
+            grep -E "Test Files|Tests +[0-9]" /tmp/unit-tests.log 2>/dev/null || echo "no summary captured"
+            echo "exit code: \`${exit_unit_tests:-n/d}\`"
+            echo ""
+            echo "**Web lint (oxlint)**"
+            grep -E "Found [0-9]+ warning|Found [0-9]+ error" /tmp/web-lint.log 2>/dev/null || echo "no summary captured"
+            echo "exit code: \`${exit_lint:-n/d}\`"
+            echo ""
+            echo "**Build** — see the Build step log"
+            echo "exit code: \`${exit_build:-n/d}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  e2e:
+    name: E2E autenticado (instancia efímera) + E1
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: pnpm/action-setup@v4
-        with:
-          version: 11
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: pnpm
 
       - name: Install dependencies
-        run: CI=true pnpm install
+        run: CI=true pnpm install --frozen-lockfile
 
-      - name: Typecheck
-        run: pnpm typecheck
+      - name: Generate API route types
+        run: pnpm --filter @crm/api typegen
 
-      - name: Run tests
-        run: pnpm test
+      # The Supabase CLI provides the ephemeral local stack (it needs Docker,
+      # which the ubuntu runner has).
+      - uses: supabase/setup-cli@v1
+        with:
+          version: v2.122.0
+
+      - name: Install Playwright browser
+        run: pnpm --filter @crm/web exec playwright install --with-deps chromium
+
+      # The stack is ephemeral: it lives in the runner and dies with it. The
+      # config is copied to a temp dir WITHOUT the repo's migrations, so the
+      # only door to the schema is the repo's own runner (db:migrate) and the
+      # ledger CI validates is that runner's.
+      - name: Start ephemeral Supabase
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/sb/supabase"
+          cp supabase/ci/config.toml "$RUNNER_TEMP/sb/supabase/config.toml"
+          cd "$RUNNER_TEMP/sb"
+          if ! supabase start --exclude studio,imgproxy,edge-runtime,vector,realtime,logflare,mailpit,supavisor > /tmp/sb-start.log 2>&1; then
+            echo "::error::No se pudo levantar la instancia efímera"
+            tail -60 /tmp/sb-start.log
+            exit 1
+          fi
+          supabase status -o env > /tmp/sb-env.sh
+          cd "$GITHUB_WORKSPACE"
+          node scripts/ci/supabase-env.mjs /tmp/sb-env.sh
+
+      # S5/S6: one validation governs migrating, starting the API and the E2E.
+      # A non-local target (the shared dev database, a production database)
+      # stops the job here.
+      - name: Validate isolated target
+        run: pnpm --filter @crm/api exec tsx scripts/assert-isolated-target.ts
+
+      - name: Apply migrations (repo runner)
+        run: pnpm --filter @crm/api db:migrate
+
+      # S9: the runner must leave a conflicting migration PENDING, report the
+      # error and NOT record it as applied.
+      - name: Prove the migration runner leaves a failed migration pending
+        run: bash scripts/ci/prove-pending-migration.sh
+
+      # S4: synthetic users and data. No real data, ever.
+      - name: Seed synthetic data
+        run: pnpm --filter @crm/api exec tsx scripts/seed-synthetic.ts
+
+      - name: Start API
+        run: |
+          pnpm --filter @crm/api dev > /tmp/api.log 2>&1 &
+          for i in $(seq 1 90); do
+            if curl -sf http://localhost:3000/api/health > /dev/null; then
+              echo "API is up"
+              break
+            fi
+            sleep 2
+          done
+          if ! curl -sf http://localhost:3000/api/health > /dev/null; then
+            echo "::error::La API no levantó en el plazo"
+            tail -40 /tmp/api.log
+            exit 1
+          fi
+
+      # S7: the API must READ a test datum within the deadline. A job that
+      # starts the API and never reads anything is a green job that proved
+      # nothing.
+      - name: API reads a test datum within the deadline
+        run: pnpm --filter @crm/api exec tsx scripts/assert-api-reads-data.ts
+
+      - name: Start web
+        run: |
+          pnpm --filter @crm/web dev --host 127.0.0.1 > /tmp/web.log 2>&1 &
+          for i in $(seq 1 90); do
+            if curl -sf http://localhost:5173/ > /dev/null; then
+              echo "web is up"
+              break
+            fi
+            sleep 2
+          done
+          if ! curl -sf http://localhost:5173/ > /dev/null; then
+            echo "::error::El servidor web no levantó en el plazo"
+            tail -40 /tmp/web.log
+            exit 1
+          fi
+
+      # S11/S12: who may change each protected field. Real DB, real tokens.
+      # Runs BEFORE Playwright: it is faster and pinpoints a failure exactly.
+      - name: E1 · suite de protección de perfiles (base real)
+        run: |
+          set +e
+          pnpm --filter @crm/api test:integration 2>&1 | tee /tmp/e1-integration.log
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "exit_e1_integration=${code}" >> "$GITHUB_ENV"
+          exit "${code}"
+
+      - name: E2E (Playwright, autenticado)
+        env:
+          BASE_URL: http://localhost:5173
+          PLAYWRIGHT_JSON_OUTPUT_NAME: /tmp/e2e-results.json
+          E2E_AUTH_MARKER: /tmp/e2e-auth-marker.txt
+        run: |
+          set +e
+          pnpm --filter @crm/web exec playwright test --reporter=list,json 2>&1 | tee /tmp/e2e.log
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "exit_e2e=${code}" >> "$GITHUB_ENV"
+          if [ "${{ inputs.controlled_failure }}" = "e2e" ]; then
+            echo "::error::FALLO CONTROLADO INYECTADO (paso: E2E)"
+            exit 1
+          fi
+          exit "${code}"
+
+      # S8: zero authenticated tests means E1 is PENDING, not green.
+      - name: Count authenticated tests
+        run: node scripts/ci/count-authenticated-tests.mjs /tmp/e2e-results.json /tmp/e2e-auth-marker.txt
+
+      - name: E2E summary
+        if: always()
+        run: |
+          {
+            echo "### E2E (Playwright) + E1"
+            echo ""
+            if [ -f /tmp/e2e.log ]; then
+              grep -E "passed|skipped|failed" /tmp/e2e.log | tail -5 || true
+              echo "exit code: \`${exit_e2e:-n/d}\`"
+            else
+              echo "OMITIDOS — 0 pruebas ejecutadas."
+            fi
+            echo ""
+            echo "**E1 · suite de protección de perfiles**"
+            if [ -f /tmp/e1-integration.log ]; then
+              grep -E "Test Files|Tests +[0-9]" /tmp/e1-integration.log | tail -4 || true
+              echo "exit code: \`${exit_e1_integration:-n/d}\`"
+            else
+              echo "OMITIDA — la suite no llegó a ejecutarse."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: |
+            /tmp/e2e.log
+            /tmp/e1-integration.log
+            /tmp/api.log
+            /tmp/web.log
+            /tmp/sb-start.log
+            /tmp/migrate-conflict.log
+          retention-days: 7
+          if-no-files-found: warn

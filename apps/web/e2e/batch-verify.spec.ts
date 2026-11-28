@@ -1,3 +1,4 @@
+import { appendFileSync } from 'node:fs'
 import { test, expect, type Page } from '@playwright/test'
 
 /**
@@ -15,10 +16,15 @@ async function signIn(page: Page, email: string, password: string) {
   await page.waitForURL((url) => !url.pathname.startsWith('/login'), { timeout: 20_000 })
 }
 
-const EMAIL = process.env.E2E_EMAIL!
-const PASSWORD = process.env.E2E_PASSWORD!
+const EMAIL = process.env.E2E_EMAIL
+const PASSWORD = process.env.E2E_PASSWORD
 
 test.describe('lote de fixes', () => {
+  // The suite needs a real account. Without credentials it must SKIP (the
+  // documented contract), not fail: filling `undefined` into the login form
+  // produces 8 red tests that say nothing about the app.
+  test.skip(!EMAIL || !PASSWORD, 'E2E_EMAIL/E2E_PASSWORD not set — skipping protected suite')
+
   // A console error on any of these pages is a real defect: a white screen
   // with a passing locator is still a broken page.
   //
@@ -29,7 +35,18 @@ test.describe('lote de fixes', () => {
   const consoleErrors: string[] = []
   test.beforeEach(async ({ page }) => {
     consoleErrors.length = 0
-    await signIn(page, EMAIL, PASSWORD)
+    await signIn(page, EMAIL!, PASSWORD!)
+    // Testigo: se escribe SOLO después de un inicio de sesión real, para que
+    // CI pueda distinguir "la suite protegida corrió" de "se omitió por falta
+    // de credenciales". Un job verde sin este testigo no probó nada.
+    const marker = process.env.E2E_AUTH_MARKER
+    if (marker) {
+      try {
+        appendFileSync(marker, 'authenticated\n')
+      } catch {
+        // El testigo es una ayuda para el job, no una condición de la prueba.
+      }
+    }
     page.on('console', (m) => {
       if (m.type() === 'error') consoleErrors.push(m.text())
     })
@@ -178,8 +195,18 @@ test.describe('lote de fixes', () => {
     await page.waitForURL('**/profile')
     await expect(page.getByRole('heading', { name: /mi perfil/i })).toBeVisible()
 
+    // Wait for the profile to land before typing: /api/me is async, and the
+    // form seeds its fields when it answers. Typing before that point is a
+    // race (the app now keeps what was typed, but the test should not depend
+    // on that). The email field only gets a value once the profile arrived.
+    await expect(page.getByLabel(/^email$/i)).toHaveValue(/@/)
+
+    // Unique per run: the assertion has to mean "this run saved this name",
+    // not "the database happened to contain it".
+    const nombre = `Nombre E2E ${Date.now()}`
+
     const name = page.getByLabel(/^nombre$/i)
-    await name.fill('Nombre E2E')
+    await name.fill(nombre)
     await page.getByLabel(/teléfono/i).fill('+52 555 999 0000')
     await page.getByRole('button', { name: /^guardar$/i }).click()
     await expect(page.getByText(/perfil guardado/i)).toBeVisible()
@@ -187,7 +214,7 @@ test.describe('lote de fixes', () => {
     // The topbar must reflect it without a reload.
     await page.goto('/')
     await expect(page.getByRole('button', { name: /abrir mi perfil/i })).toContainText(
-      'Nombre E2E',
+      nombre,
     )
   })
 })

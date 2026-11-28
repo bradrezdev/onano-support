@@ -206,7 +206,14 @@ export async function updateUser(
     throw new UserValidationError('user_deleted', 'User is deleted')
   }
 
-  const update: Record<string, unknown> = {}
+  // What changes, resolved BEFORE the write so the write is a single call.
+  const change: {
+    role_key?: string
+    legacy_role?: string
+    suspend?: boolean
+    display_name?: string
+  } = {}
+
   if (patch.role !== undefined && patch.role !== before.role_key) {
     const { data: role } = await admin
       .from('roles')
@@ -216,33 +223,52 @@ export async function updateUser(
     if (!role) {
       throw new UserValidationError('role_not_found', `El rol "${patch.role}" no existe`)
     }
-    update.role_key = role.key
+    change.role_key = role.key
     // Only the shipped slugs may be mirrored into the legacy constrained
     // column; a custom role has no value that would pass the check.
     if (role.is_system && (role.key === 'admin' || role.key === 'supervisor' || role.key === 'soporte')) {
-      update.role = role.key
+      change.legacy_role = role.key
     }
   }
   if (patch.suspend !== undefined) {
     const wantsSuspended = patch.suspend
     const isSuspended = before.suspended_at !== null
     if (wantsSuspended !== isSuspended) {
-      update.suspended_at = wantsSuspended ? new Date().toISOString() : null
-      update.suspended_by = wantsSuspended ? actorId : null
+      change.suspend = wantsSuspended
     }
   }
   if (patch.display_name !== undefined) {
-    update.display_name = patch.display_name.trim()
+    change.display_name = patch.display_name.trim()
   }
 
-  if (Object.keys(update).length === 0) {
+  if (Object.keys(change).length === 0) {
     return before
   }
 
-  const { error } = await admin.from('profiles').update(update).eq('id', id)
+  // The write goes through `admin_update_profile`: the change AND its audit
+  // entry land in the same transaction. Two separate calls would leave a role
+  // changed with no trail whenever the second one failed.
+  const { error } = await admin.rpc('admin_update_profile', {
+    p_profile_id: id,
+    p_role_key: change.role_key ?? null,
+    p_suspend: change.suspend ?? null,
+    p_display_name: change.display_name ?? null,
+    p_actor: actorId,
+  })
   if (error) throw error
 
-  return { ...before, ...update } as UserWithProfile
+  return {
+    ...before,
+    ...(change.role_key !== undefined ? { role_key: change.role_key } : {}),
+    ...(change.legacy_role !== undefined ? { role: change.legacy_role } : {}),
+    ...(change.suspend !== undefined
+      ? {
+          suspended_at: change.suspend ? new Date().toISOString() : null,
+          suspended_by: change.suspend ? actorId : null,
+        }
+      : {}),
+    ...(change.display_name !== undefined ? { display_name: change.display_name } : {}),
+  } as UserWithProfile
 }
 
 export interface CreateUserInput {

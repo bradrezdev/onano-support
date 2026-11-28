@@ -33,6 +33,7 @@ class QueryMock {
 
 const mockAdmin: any = {
   from: vi.fn((): QueryMock => new QueryMock()),
+  rpc: vi.fn(),
   auth: {
     admin: {
       listUsers: vi.fn(),
@@ -51,6 +52,8 @@ const users = await import('./users')
 
 beforeEach(() => {
   mockAdmin.from.mockReset()
+  mockAdmin.rpc.mockReset()
+  mockAdmin.rpc.mockResolvedValue({ data: null, error: null })
   mockAdmin.auth.admin.listUsers.mockReset()
   mockAdmin.auth.admin.getUserById.mockReset()
   mockAdmin.auth.admin.createUser.mockReset()
@@ -151,35 +154,36 @@ describe('updateUser — mutations', () => {
     const roleQ = new QueryMock()
     roleQ.payload = { data: { key: 'supervisor', is_system: true }, error: null }
     mockAdmin.from.mockReturnValueOnce(roleQ)
-    const updateQ = new QueryMock()
-    updateQ.payload = { data: null, error: null }
-    mockAdmin.from.mockReturnValueOnce(updateQ)
 
     const out = await users.updateUser('u-2', { role: 'supervisor' }, 'u-1')
     expect(out.role_key).toBe('supervisor')
-    // A shipped role mirrors into both columns; the legacy one keeps its
-    // check constraint satisfied.
-    const updateOp = updateQ.ops.find((o) => o.op === 'update')
-    expect(updateOp!.args[0]).toEqual({ role_key: 'supervisor', role: 'supervisor' })
-    const eqOp = updateQ.ops.find((o) => o.op === 'eq')
-    expect(eqOp!.args).toEqual(['id', 'u-2'])
+    // One transactional call carries the change AND writes its audit entry.
+    expect(mockAdmin.rpc).toHaveBeenCalledWith('admin_update_profile', {
+      p_profile_id: 'u-2',
+      p_role_key: 'supervisor',
+      p_suspend: null,
+      p_display_name: null,
+      p_actor: 'u-1',
+    })
+    // A shipped role mirrors into the legacy column too; that mirroring is
+    // decided in SQL, where the CHECK constraint lives.
+    expect(out.role).toBe('supervisor')
   })
 
-  it('writes only role_key for a custom role, leaving the legacy column alone', async () => {
+  it('passes only the slug for a custom role, leaving the legacy column to SQL', async () => {
     const before = makeProfile({ id: 'u-2', role: 'soporte', role_key: 'soporte' })
     setUpFindUser(before)
     const roleQ = new QueryMock()
     roleQ.payload = { data: { key: 'auditor', is_system: false }, error: null }
     mockAdmin.from.mockReturnValueOnce(roleQ)
-    const updateQ = new QueryMock()
-    updateQ.payload = { data: null, error: null }
-    mockAdmin.from.mockReturnValueOnce(updateQ)
 
     await users.updateUser('u-2', { role: 'auditor' }, 'u-1')
-    const updateOp = updateQ.ops.find((o) => o.op === 'update')
-    // A custom slug cannot pass the legacy check constraint, so it is not
-    // written there. role_key is the source of truth.
-    expect(updateOp!.args[0]).toEqual({ role_key: 'auditor' })
+    // A custom slug cannot pass the legacy check constraint, so SQL leaves
+    // that column alone. role_key is the source of truth.
+    expect(mockAdmin.rpc).toHaveBeenCalledWith(
+      'admin_update_profile',
+      expect.objectContaining({ p_role_key: 'auditor' }),
+    )
   })
 
   it('rejects a role that does not exist', async () => {
@@ -192,74 +196,70 @@ describe('updateUser — mutations', () => {
     await expect(users.updateUser('u-2', { role: 'ghost' }, 'u-1')).rejects.toMatchObject({
       code: 'role_not_found',
     })
+    expect(mockAdmin.rpc).not.toHaveBeenCalled()
   })
 
-  it('does not call update when role patch equals current role', async () => {
+  it('does not write when role patch equals current role', async () => {
     const before = makeProfile({ id: 'u-2', role: 'admin', role_key: 'admin' })
     setUpFindUser(before)
-    // No update call expected; if it were, we would mockReturnValueOnce and fail.
+    // No write expected; if it were, the rpc mock would record it.
     const out = await users.updateUser('u-2', { role: 'admin' }, 'u-1')
     expect(out.id).toBe('u-2')
+    expect(mockAdmin.rpc).not.toHaveBeenCalled()
   })
 
   it('suspends user when patch.suspend is true and user is currently active', async () => {
     const before = makeProfile({ id: 'u-2', suspended_at: null })
     setUpFindUser(before)
-    const updateQ = new QueryMock()
-    updateQ.payload = { data: null, error: null }
-    mockAdmin.from.mockReturnValueOnce(updateQ)
 
     const out = await users.updateUser('u-2', { suspend: true }, 'u-1')
     expect(out.suspended_at).toBeTruthy()
     expect((out as unknown as Record<string, unknown>).suspended_by).toBe('u-1')
-    const written = updateQ.ops.find((o) => o.op === 'update')!.args[0] as Record<string, unknown>
-    expect(written.suspended_at).toBeTruthy()
-    expect(written.suspended_by).toBe('u-1')
+    expect(mockAdmin.rpc).toHaveBeenCalledWith(
+      'admin_update_profile',
+      expect.objectContaining({ p_suspend: true, p_actor: 'u-1' }),
+    )
   })
 
   it('reactivates user when patch.suspend is false and user is currently suspended', async () => {
     const before = makeProfile({ id: 'u-2', suspended_at: '2026-01-15T00:00:00Z' })
     setUpFindUser(before)
-    const updateQ = new QueryMock()
-    updateQ.payload = { data: null, error: null }
-    mockAdmin.from.mockReturnValueOnce(updateQ)
 
     const out = await users.updateUser('u-2', { suspend: false }, 'u-1')
     expect(out.suspended_at).toBeNull()
-    const written = updateQ.ops.find((o) => o.op === 'update')!.args[0] as Record<string, unknown>
-    expect(written.suspended_at).toBeNull()
-    expect(written.suspended_by).toBeNull()
+    expect(mockAdmin.rpc).toHaveBeenCalledWith(
+      'admin_update_profile',
+      expect.objectContaining({ p_suspend: false }),
+    )
   })
 
-  it('does not call update when suspension state already matches', async () => {
+  it('does not write when suspension state already matches', async () => {
     const before = makeProfile({ id: 'u-2', suspended_at: null })
     setUpFindUser(before)
     const out = await users.updateUser('u-2', { suspend: false }, 'u-1')
     expect(out.id).toBe('u-2')
+    expect(mockAdmin.rpc).not.toHaveBeenCalled()
   })
 
   it('trims display_name on patch', async () => {
     const before = makeProfile({ id: 'u-2', display_name: 'Alice' })
     setUpFindUser(before)
-    const updateQ = new QueryMock()
-    updateQ.payload = { data: null, error: null }
-    mockAdmin.from.mockReturnValueOnce(updateQ)
 
     const out = await users.updateUser('u-2', { display_name: '  Alice Cooper  ' }, 'u-1')
     expect(out.display_name).toBe('Alice Cooper')
-    const written = updateQ.ops.find((o) => o.op === 'update')!.args[0] as Record<string, unknown>
-    expect(written.display_name).toBe('Alice Cooper')
+    expect(mockAdmin.rpc).toHaveBeenCalledWith(
+      'admin_update_profile',
+      expect.objectContaining({ p_display_name: 'Alice Cooper' }),
+    )
   })
 
-  it('propagates Supabase errors from update', async () => {
+  it('propagates Supabase errors from the transactional write', async () => {
     const before = makeProfile({ id: 'u-2', role: 'soporte', role_key: 'soporte' })
     setUpFindUser(before)
     const roleQ = new QueryMock()
     roleQ.payload = { data: { key: 'admin', is_system: true }, error: null }
     mockAdmin.from.mockReturnValueOnce(roleQ)
-    const updateQ = new QueryMock()
-    updateQ.payload = { data: null, error: { message: 'db down' } }
-    mockAdmin.from.mockReturnValueOnce(updateQ)
+    mockAdmin.rpc.mockResolvedValue({ data: null, error: { message: 'db down' } })
     await expect(
       users.updateUser('u-2', { role: 'admin' }, 'u-1'),
     ).rejects.toBeDefined()

@@ -24,14 +24,22 @@ export default function ProfilePage() {
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [saved, setSaved] = useState(false)
+  // Whether the person already touched the form. `dirty` is what keeps the
+  // arrival of /api/me from wiping what they typed.
+  const [dirty, setDirty] = useState(false)
 
   // Seed from the resolved profile once it arrives; /api/me is async, so the
   // first render legitimately has nothing to show.
+  //
+  // The seeding is skipped when the form is already dirty. Without that
+  // guard, typing while your profile was still loading got overwritten the
+  // moment /api/me answered: the field went back to the old name and the
+  // save persisted the previous value while the UI said "Perfil guardado".
   useEffect(() => {
-    if (!profile) return
+    if (!profile || dirty) return
     setDisplayName(profile.display_name ?? '')
     setPhone(profile.phone ?? '')
-  }, [profile])
+  }, [profile, dirty])
 
   async function save(e: React.FormEvent) {
     e.preventDefault()
@@ -96,7 +104,10 @@ export default function ProfilePage() {
             placeholder="Cómo te llamamos"
             className="input mt-1"
             value={displayName}
-            onChange={(e) => setDisplayName(e.target.value)}
+            onChange={(e) => {
+              setDirty(true)
+              setDisplayName(e.target.value)
+            }}
           />
           <p className="mt-1 text-xs text-slate-500">
             Si lo dejás vacío, los listados muestran tu email.
@@ -114,7 +125,10 @@ export default function ProfilePage() {
             placeholder="+52 555 123 4567"
             className="input mt-1"
             value={phone}
-            onChange={(e) => setPhone(e.target.value)}
+            onChange={(e) => {
+              setDirty(true)
+              setPhone(e.target.value)
+            }}
           />
           <p className="mt-1 text-xs text-slate-500">
             Para que te localize el equipo. Opcional.
