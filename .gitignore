@@ -29,3 +29,10 @@ supabase/.temp
 **/test-results/
 **/playwright-report/
 **/playwright/.cache/
+# pnpm es el unico gestor de paquetes: nunca se commitean estos lockfiles
+package-lock.json
+yarn.lock
+pnpm-lock.yaml.bak
+
+# Configuracion local del revisor de codigo (GGA)
+.gga
