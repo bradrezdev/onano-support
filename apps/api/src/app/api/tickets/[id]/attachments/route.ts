@@ -20,6 +20,11 @@ const AttachBody = z.object({
  *
  * `ticket.read` rather than a stronger key: seeing the evidence is part of
  * reading the ticket, not a separate power.
+ *
+ * The list is filtered ROW BY ROW: a ticket can hold evidence from several
+ * chats and each row has its own holder. The ticket's holder sees all of it,
+ * but an agent who only attends one of those chats sees only that chat's
+ * evidence. The same rule applies to the preview and to the download.
  */
 export async function GET(request: Request, ctx: Params) {
   const auth = await requirePermission(['ticket.read'], request)
