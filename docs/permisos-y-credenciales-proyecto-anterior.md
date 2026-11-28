@@ -43,7 +43,7 @@ Cómo está protegida:
 |---|---|
 | ¿Hay un token vigente en el entorno? | **No**: `TWILIO_AUTH_TOKEN` está **vacío** en `apps/api/.env` y en `apps/api/.env.legacy` |
 | ¿Se guardó alguna vez en la base? | **No**: `profiles` conserva las columnas `twilio_*` pero **0 filas** con valores |
-| ¿Entró al repositorio? | **No**: 0 coincidencias del valor de ninguna credencial en los 31 commits del historial |
+| ¿Entró al repositorio? | **No**: 0 coincidencias del valor de ninguna credencial en todo el historial (todas las ramas) |
 | ¿Quedó expuesto por una política de base de datos? | Las políticas de `profiles` **exponían las columnas** a cualquier autenticado, pero estaban **vacías**: no había nada que exponer |
 
 **Veredicto:** con la evidencia disponible **no hay un token de Twilio vigente que haya podido quedar expuesto**. La rotación no está indicada por los datos. Si existe un token en la cuenta de Twilio que se usó en el pasado, su rotación es una decisión del operador y no se puede verificar desde este entorno. Lo que sí era real era el **riesgo estructural**: las columnas `twilio_auth_token` vivían en una tabla con política de lectura para cualquier autenticado. E1 las elimina.
@@ -52,15 +52,39 @@ Cómo está protegida:
 
 | Pregunta | Respuesta con evidencia |
 |---|---|
-| ¿Entró al repositorio? | **No**: 0 coincidencias en los 31 commits |
+| ¿Entró al repositorio? | **No**: 0 coincidencias en todo el historial |
 | ¿Se guardó en la base? | **No**: es una clave de la plataforma, no una columna |
 | ¿Quién podía leerla en esta máquina? | **Cualquier usuario del equipo**: los `.env` estaban en modo `644`. Corregido a `600` |
 | ¿Es la clave que puede saltarse RLS? | **Sí**: con ella se leen y escriben TODAS las tablas, saltándose RLS y los `GRANT` |
 
-**Veredicto:** el `service_role` es **la** credencial crítica de este proyecto (y la `DATABASE_URL` es el superusuario de Postgres, que es aún peor). No hay evidencia de que saliera del equipo, pero hay dos hechos que justifican rotarla cuando el proyecto alojado vuelva a usarse:
+**Veredicto:** el `service_role` es **la** credencial crítica de este proyecto (y la `DATABASE_URL` es el superusuario de Postgres, que es aún peor). No hay evidencia de que saliera del equipo, pero **la exposición es plausible**, así que su rotación es la prioridad cuando el proyecto alojado vuelva a estar en uso.
 
-1. Ese proyecto sufrió un **PITR** y un vaciado sin autor conocido: el personal de la plataforma tuvo acceso a la base durante ese proceso.
-2. La clave convive con una `DATABASE_URL` de superusuario en el mismo archivo, y ese archivo estaba en modo `644` hasta hace un momento.
+### Qué se sabe y qué no sobre el incidente de ese proyecto
+
+- **La causa del cambio de esquema NO está confirmada.** La plataforma comunicó una restauración (PITR) de ese proyecto, pero eso **no prueba** quién vació el esquema ni por qué `public` volvió a mostrar 25 tablas. Lo único verificable por evidencia propia es el *cuándo* de las migraciones (ledger: 2026-10-20 a 2026-10-26) y la secuencia observada (24 tablas → 0 → 25). Cualquier atribución —a un PITR, a un vaciado o a una migración— es **una hipótesis, no una causa**, y así queda registrada.
+- Por eso la evaluación de credenciales se hace **por credencial y por superficie**, sin apoyarse en la causa.
+
+### Quién pudo leer cada credencial
+
+| Credencial | ¿Alguien pudo leerla? | Evidencia | Hoy |
+|---|---|---|---|
+| `SUPABASE_SECRET_KEY` (`service_role`) | **Sí, plausible**: cualquiera con permiso de lectura sobre el archivo | el archivo estuvo en modo `644` mientras las dos credenciales convivían en él | `600` |
+| Contraseña del superusuario de Postgres (`DATABASE_URL`) | **Sí, plausible**: el mismo archivo, la misma ventana | ídem | `600` |
+| Token de Twilio | **No**: no hay token vigente en el entorno ni en la base | `TWILIO_AUTH_TOKEN` vacío, 0 filas con `twilio_*` | no aplica |
+
+El alcance de esa ventana de `644` **no se limita a "los usuarios de la máquina"**: la máquina tiene una sola cuenta humana, así que el lector plausible es **cualquier proceso que corra como ese usuario** (agentes, extensiones del editor, scripts de `npm install`, tareas programadas). Por eso la exposición se califica de plausible aunque no haya un segundo usuario.
+
+### ¿Entró al repositorio?
+
+**No**, verificado sobre el historial completo (`git log -p --all`, todas las ramas): **0 ocurrencias** del valor de la clave `service_role` y **0** de la contraseña del superusuario. Esto pesa más de lo habitual porque **el repositorio es público** (`bradrezdev/onano-support`, `visibility: PUBLIC`): si un solo commit hubiera llevado una credencial, estaría expuesta al mundo desde el primer clon. El único `.env` versionado es `.env.example`, sin valores reales.
+
+### Prioridad de rotación
+
+1. **`SUPABASE_SECRET_KEY` (`service_role`)** — salta RLS y todos los `GRANT`: lee y escribe todas las tablas.
+2. **Contraseña del superusuario de Postgres** — expone todo el servidor, incluido el vault.
+3. Token de Twilio — solo si el operador confirma que existe uno vigente.
+
+**Cómo y cuándo:** la rotación se hace desde el panel del proyecto (API keys y contraseña de base de datos) **cuando el proyecto alojado vuelva a usarse**; mientras tanto el entorno de desarrollo apunta al stack local y no usa esas credenciales. Desde este entorno **no se puede rotar**: falta `SUPABASE_ACCESS_TOKEN` y el proyecto está en modo consulta —**no se le escribe nunca**. Si se rota, hay que actualizar `apps/api/.env.legacy` en el mismo movimiento, o el entorno local queda apuntando a una credencial muerta.
 
 **Prioridad recomendada:** `service_role` **antes** que el token de Twilio, y solo cuando el proyecto alojado vuelva a estar en uso (mientras tanto no se usa: el entorno de desarrollo apunta al stack local).
 
