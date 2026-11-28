@@ -270,7 +270,7 @@ jobs:
       # recepción de WhatsApp (E3). Si alguna no aparece, se omite o se queda
       # corta, el job falla.
       - name: Count access controls
-        run: node scripts/ci/count-access-controls.mjs /tmp/integration-results.json 32 7
+        run: node scripts/ci/count-access-controls.mjs /tmp/integration-results.json 32 8
 
       - name: E2E (Playwright, autenticado)
         env:

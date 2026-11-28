@@ -447,4 +447,37 @@ suite('E3 · recepción de WhatsApp', () => {
     expect(res.contentType).toContain('text/xml')
     expect(res.body).toBe(EMPTY_TWIML)
   })
+
+  // ------------------------------------------------------------------ H
+
+  it('H · un MessageSid repetido NO reabre un hilo que el agente cerró', async () => {
+    const phone = uniquePhone()
+    phones.push(phone)
+    const sid = uniqueSid()
+    const params = baseParams(phone, sid, 'mensaje antes del cierre')
+    const signature = sign(params)
+
+    expect((await postWebhook(params, signature)).status).toBe(200)
+
+    const contact = await contactByPhone(phone)
+    const before = await conversationsOf(contact!.id)
+    expect(before.length).toBe(1)
+    const conversationId = before[0]!.id
+
+    // El agente cierra el hilo.
+    const closed = await service
+      .from('conversations')
+      .update({ status: 'closed' })
+      .eq('id', conversationId)
+    expect(closed.error).toBeNull()
+
+    // Lega DE NUEVO el mismo mensaje: es un reintento tardío de Twilio, no un
+    // mensaje nuevo. No puede insertar nada ni tocar el hilo.
+    expect((await postWebhook(params, signature)).status).toBe(200)
+
+    expect((await messagesBySid(sid)).length).toBe(1)
+    const after = await conversationsOf(contact!.id)
+    expect(after[0]!.unread_count).toBe(1)
+    expect(after[0]!.status).toBe('closed')
+  })
 })

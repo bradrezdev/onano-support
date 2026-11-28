@@ -22,7 +22,7 @@ import { readFileSync } from 'node:fs'
 
 const file = process.argv[2]
 const MINIMUM = Number(process.argv[3] ?? 32)
-const INBOUND_MINIMUM = Number(process.argv[4] ?? 7)
+const INBOUND_MINIMUM = Number(process.argv[4] ?? 8)
 
 const SUITES = [
   {

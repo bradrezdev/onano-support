@@ -76,7 +76,10 @@ declare
   v_name text;
   v_contact public.contacts%rowtype;
   v_conv public.conversations%rowtype;
-  v_msg public.messages%rowtype;
+  v_msg_id uuid;
+  v_msg_conv uuid;
+  v_dup_contact uuid;
+  v_status text;
   v_unread integer;
   v_inserted boolean := false;
 begin
@@ -96,6 +99,22 @@ begin
   -- simultáneas del mismo número: la segunda espera aquí y, al despertar,
   -- ya ve el cliente y el hilo que creó la primera.
   perform pg_advisory_xact_lock(hashtextextended(v_phone, 0));
+
+  -- Un MessageSid repetido NO debe tener efectos. Se comprueba PRIMERO, antes
+  -- de tocar nada: si el mensaje ya existe, se devuelve tal cual y el hilo NO
+  -- se reabre. (Una entrega duplicada tardía no puede reabrir un chat que un
+  -- agente cerró: el reintento de Twilio es un duplicado, no un mensaje nuevo.)
+  select m.id, m.conversation_id into v_msg_id, v_msg_conv
+    from public.messages m
+   where m.twilio_sid = p_twilio_sid;
+  if found then
+    select c.contact_id, c.status, c.unread_count into v_dup_contact, v_status, v_unread
+      from public.conversations c
+     where c.id = v_msg_conv;
+    return query
+      select v_msg_conv, v_msg_id, v_dup_contact, false, v_status, v_unread;
+    return;
+  end if;
 
   -- El cliente: se busca por número normalizado y se crea si no existe.
   -- Un cliente dado de baja (deleted_at) se reutiliza: su número sigue
@@ -135,26 +154,35 @@ begin
     returning * into v_conv;
   end if;
 
-  -- El mensaje: idempotente por MessageSid. Un MessageSid repetido NO es un
-  -- error: no se inserta nada y el disparador de no leídos no se dispara.
-  select * into v_msg
-    from public.messages m
-   where m.twilio_sid = p_twilio_sid;
-  if not found then
-    insert into public.messages (conversation_id, direction, body, media_urls, twilio_sid)
-    values (v_conv.id, 'in', p_body, coalesce(p_media_urls, '[]'::jsonb), p_twilio_sid)
-    returning * into v_msg;
+  -- El mensaje: ya se comprobó arriba que el MessageSid no existe, así que
+  -- aquí se inserta. El ON CONFLICT cubre la carrera restante (dos entregas
+  -- simultáneas del mismo sid): el que pierde no inserta ni mueve el
+  -- contador de no leídos.
+  -- El alias evita la ambiguedad con el parametro de salida `conversation_id`.
+  insert into public.messages as m (conversation_id, direction, body, media_urls, twilio_sid)
+  values (v_conv.id, 'in', p_body, coalesce(p_media_urls, '[]'::jsonb), p_twilio_sid)
+  on conflict (twilio_sid) do nothing
+  returning m.id, m.conversation_id into v_msg_id, v_msg_conv;
+  if v_msg_id is not null then
     v_inserted := true;
+  else
+    -- La carrera se decidió en la otra entrega: se devuelve su mensaje.
+    select m.id, m.conversation_id into v_msg_id, v_msg_conv
+      from public.messages m
+     where m.twilio_sid = p_twilio_sid;
+    select c.contact_id into v_dup_contact
+      from public.conversations c
+     where c.id = v_msg_conv;
   end if;
 
   -- El contador de no leídos lo sube el disparador al insertar el mensaje:
   -- se relee DESPUÉS para reportar el valor real (un duplicado no lo mueve).
   select c.unread_count into v_unread
     from public.conversations c
-   where c.id = v_msg.conversation_id;
+   where c.id = v_msg_conv;
 
   return query
-    select v_msg.conversation_id, v_msg.id, v_contact.id, v_inserted, v_conv.status, v_unread;
+    select v_msg_conv, v_msg_id, v_contact.id, v_inserted, v_conv.status, v_unread;
 end;
 $$;
 
