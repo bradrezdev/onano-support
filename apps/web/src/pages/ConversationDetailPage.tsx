@@ -48,6 +48,7 @@ export default function ConversationDetailPage() {
   const [linkError, setLinkError] = useState<string | null>(null)
   const [agents, setAgents] = useState<AssignableAgent[]>([])
   const [ownerChoice, setOwnerChoice] = useState('')
+  const [reason, setReason] = useState('')
 
   // W1: pick messages here, pin them to a ticket there.
   const [attachMode, setAttachMode] = useState(false)
@@ -129,14 +130,34 @@ export default function ConversationDetailPage() {
   }
 
   async function reassign(agentId: string | null) {
+    if (!reason.trim()) {
+      setError('Indica el motivo de la transferencia')
+      return
+    }
+    if (!detail) return
+
     setBusy(true)
     setError(null)
     try {
-      await api.patch(`/api/conversations/${id}`, { assigned_agent_id: agentId })
+      await api.patch(`/api/conversations/${id}`, {
+        assigned_agent_id: agentId,
+        reason: reason.trim(),
+        expected_version: detail.conversation.assignment_version,
+      })
       setOwnerChoice('')
+      setReason('')
       await load()
     } catch (err) {
-      setError((err as ApiError).message)
+      if (
+        err instanceof ApiError &&
+        err.status === 409 &&
+        err.code === 'version_conflict'
+      ) {
+        await load()
+        setError('El chat cambió mientras lo transferías: revisa el titular actual.')
+      } else {
+        setError((err as ApiError).message)
+      }
     } finally {
       setBusy(false)
     }
@@ -176,7 +197,18 @@ export default function ConversationDetailPage() {
           : prev,
       )
     } catch (err) {
-      setSendError((err as ApiError).message)
+      if (
+        err instanceof ApiError &&
+        err.status === 409 &&
+        err.code === 'assignment_changed'
+      ) {
+        setSendError(
+          'Este chat cambió de titular mientras redactabas: tu mensaje no se guardó.',
+        )
+        await load()
+      } else {
+        setSendError((err as ApiError).message)
+      }
     } finally {
       setBusy(false)
     }
@@ -218,7 +250,10 @@ export default function ConversationDetailPage() {
   }
   if (error) {
     return (
-      <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+      <div
+        className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700"
+        aria-live="polite"
+      >
         {error}
       </div>
     )
@@ -274,12 +309,7 @@ export default function ConversationDetailPage() {
           <>
             <select
               value={ownerChoice}
-              onChange={(e) => {
-                const v = e.target.value
-                setOwnerChoice(v)
-                if (v === '__unassign__') void reassign(null)
-                else if (v) void reassign(v)
-              }}
+              onChange={(e) => setOwnerChoice(e.target.value)}
               disabled={busy}
               className="input text-sm"
               aria-label="Reasignar conversación"
@@ -292,6 +322,24 @@ export default function ConversationDetailPage() {
                 </option>
               ))}
             </select>
+            <input
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              placeholder="Motivo de la transferencia"
+              className="input text-sm"
+              aria-label="Motivo de la transferencia"
+            />
+            <button
+              type="button"
+              onClick={() => {
+                if (ownerChoice === '__unassign__') void reassign(null)
+                else if (ownerChoice) void reassign(ownerChoice)
+              }}
+              disabled={busy || !ownerChoice}
+              className="btn-primary text-sm"
+            >
+              Transferir
+            </button>
 
             <select
               value=""
@@ -442,7 +490,9 @@ export default function ConversationDetailPage() {
             className="input"
           />
           {sendError && (
-            <p className="mt-2 text-sm text-red-700">{sendError}</p>
+            <p className="mt-2 text-sm text-red-700" aria-live="polite">
+              {sendError}
+            </p>
           )}
           <div className="mt-2 flex justify-end">
             <button

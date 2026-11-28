@@ -20,6 +20,7 @@ export interface Conversation {
   unread_count: number
   created_at: string
   contact: ConversationContact | null
+  assignment_version: number
 }
 
 export interface ConversationMessage {
