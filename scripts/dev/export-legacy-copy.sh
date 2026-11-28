@@ -17,6 +17,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 LEGACY_ENV="${REPO_ROOT}/apps/api/.env.legacy"
 COPY_CONTAINER="crm_legacy_copy"
 COPY_VOLUME="crm_legacy_copy_data"
+# Red dedicada: la copia con datos reales no comparte red con ningún otro
+# contenedor, así que ningún stack puede alcanzarla por la red interna.
+COPY_NETWORK="crm_legacy_copy_net"
 DUMP_DIR="${BACKUP_DIR:-$HOME/supabase-dev/backups}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 DUMP="${DUMP_DIR}/legacy-public-${STAMP}.sql"
@@ -90,7 +93,12 @@ echo "   ${DUMP}"
 echo
 echo "== 2 · copia privada separada (contenedor y volumen propios) =="
 if ! docker ps -a --format '{{.Names}}' | grep -qx "${COPY_CONTAINER}"; then
+  # Red propia: la copia NO comparte red con ningún otro contenedor (ni con
+  # el stack de desarrollo). El aislamiento es por red, no solo por puertos.
+  docker network inspect "${COPY_NETWORK}" > /dev/null 2>&1 ||
+    docker network create "${COPY_NETWORK}" > /dev/null
   docker run -d --name "${COPY_CONTAINER}" \
+    --network "${COPY_NETWORK}" \
     -e POSTGRES_PASSWORD=postgres \
     -v "${COPY_VOLUME}:/var/lib/postgresql/data" postgres:15 > /dev/null
 fi

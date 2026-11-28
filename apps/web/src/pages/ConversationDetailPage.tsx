@@ -6,6 +6,7 @@ import clsx from 'clsx'
 import { api, ApiError } from '@/lib/api'
 import { useAuthStore } from '@/stores/auth'
 import { canWith } from '@/lib/permissions'
+import { clearDraft, draftKey, readDraft, writeDraft } from '@/lib/drafts'
 import type {
   ConversationDetail,
   ConversationMessage,
@@ -42,12 +43,24 @@ export default function ConversationDetailPage() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [draft, setDraft] = useState('')
+  /**
+   * The draft belongs to ONE (agent, chat) pair. The agent id comes from the
+   * resolved profile (the API decides who the agent is, never the browser),
+   * and the chat id from the route. The key carries both, so the browser
+   * never mixes two people's answers.
+   */
+  const agentId = profile?.id ?? null
+  const draftScope = agentId && id ? draftKey(agentId, id) : null
+  const [draftScopeLoaded, setDraftScopeLoaded] = useState<string | null>(null)
+  /** The actor lost every right over this chat: the case is withdrawn. */
+  const [accessLost, setAccessLost] = useState(false)
   const [busy, setBusy] = useState(false)
   const [sendError, setSendError] = useState<string | null>(null)
   const [linkInput, setLinkInput] = useState('')
   const [linkError, setLinkError] = useState<string | null>(null)
   const [agents, setAgents] = useState<AssignableAgent[]>([])
   const [ownerChoice, setOwnerChoice] = useState('')
+  const [reason, setReason] = useState('')
 
   // W1: pick messages here, pin them to a ticket there.
   const [attachMode, setAttachMode] = useState(false)
@@ -62,6 +75,38 @@ export default function ConversationDetailPage() {
       else next.add(messageId)
       return next
     })
+  }
+
+  /**
+   * Changing chat (or agent) leaves the previous draft behind: the draft of
+   * one client never appears in another client's conversation.
+   *
+   * This is React's "adjust the state when the inputs change" pattern: the
+   * draft is re-read during the render that follows the change, not in an
+   * effect, so the screen never shows one frame with the wrong draft.
+   */
+  if (draftScope !== draftScopeLoaded) {
+    setDraftScopeLoaded(draftScope)
+    setDraft(draftScope && agentId ? readDraft(agentId, id) : '')
+  }
+
+  /** Writes the draft as the operator types, under the (agent, chat) key. */
+  function updateDraft(value: string) {
+    setDraft(value)
+    if (agentId) writeDraft(agentId, id, value)
+  }
+
+  /**
+   * The actor lost every right over this chat (the API answered 403): the
+   * cached history leaves the screen and the draft of a chat that can no
+   * longer be opened goes with it.
+   */
+  function withdrawAccess() {
+    setAccessLost(true)
+    setDetail(null)
+    setLinked([])
+    setDraft('')
+    if (agentId) clearDraft(agentId, id)
   }
 
   async function attachSelected() {
@@ -91,7 +136,15 @@ export default function ConversationDetailPage() {
       ])
       setDetail(d.data)
       setLinked(lt.data)
+      // The chat is readable: the withdrawal notice of a previous chat (or a
+      // previous attempt) does not follow the operator to this one.
+      setAccessLost(false)
     } catch (err) {
+      if (err instanceof ApiError && err.status === 403) {
+        // The chat is not readable any more: the history leaves the screen.
+        withdrawAccess()
+        return
+      }
       setError((err as ApiError).message)
     } finally {
       setLoading(false)
@@ -129,14 +182,34 @@ export default function ConversationDetailPage() {
   }
 
   async function reassign(agentId: string | null) {
+    if (!reason.trim()) {
+      setError('Indica el motivo de la transferencia')
+      return
+    }
+    if (!detail) return
+
     setBusy(true)
     setError(null)
     try {
-      await api.patch(`/api/conversations/${id}`, { assigned_agent_id: agentId })
+      await api.patch(`/api/conversations/${id}`, {
+        assigned_agent_id: agentId,
+        reason: reason.trim(),
+        expected_version: detail.conversation.assignment_version,
+      })
       setOwnerChoice('')
+      setReason('')
       await load()
     } catch (err) {
-      setError((err as ApiError).message)
+      if (
+        err instanceof ApiError &&
+        err.status === 409 &&
+        err.code === 'version_conflict'
+      ) {
+        await load()
+        setError('El chat cambió mientras lo transferías: revisa el titular actual.')
+      } else {
+        setError((err as ApiError).message)
+      }
     } finally {
       setBusy(false)
     }
@@ -165,6 +238,7 @@ export default function ConversationDetailPage() {
         { body: draft.trim() },
       )
       setDraft('')
+      if (agentId) clearDraft(agentId, id)
       setDetail((prev) =>
         prev
           ? {
@@ -176,7 +250,24 @@ export default function ConversationDetailPage() {
           : prev,
       )
     } catch (err) {
-      setSendError((err as ApiError).message)
+      if (err instanceof ApiError && err.status === 403) {
+        // The chat was taken away while the answer was being written: the
+        // history and the draft leave the screen.
+        withdrawAccess()
+        return
+      }
+      if (
+        err instanceof ApiError &&
+        err.status === 409 &&
+        err.code === 'assignment_changed'
+      ) {
+        setSendError(
+          'Este chat cambió de titular mientras redactabas: tu mensaje no se guardó.',
+        )
+        await load()
+      } else {
+        setSendError((err as ApiError).message)
+      }
     } finally {
       setBusy(false)
     }
@@ -216,9 +307,23 @@ export default function ConversationDetailPage() {
   if (loading) {
     return <div className="card p-6 text-sm text-slate-500">Cargando…</div>
   }
+  if (accessLost) {
+    return (
+      <div
+        className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800"
+        aria-live="polite"
+      >
+        Ya no tienes acceso a esta conversación: se retiró el historial de esta
+        pantalla.
+      </div>
+    )
+  }
   if (error) {
     return (
-      <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+      <div
+        className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700"
+        aria-live="polite"
+      >
         {error}
       </div>
     )
@@ -274,12 +379,7 @@ export default function ConversationDetailPage() {
           <>
             <select
               value={ownerChoice}
-              onChange={(e) => {
-                const v = e.target.value
-                setOwnerChoice(v)
-                if (v === '__unassign__') void reassign(null)
-                else if (v) void reassign(v)
-              }}
+              onChange={(e) => setOwnerChoice(e.target.value)}
               disabled={busy}
               className="input text-sm"
               aria-label="Reasignar conversación"
@@ -292,6 +392,24 @@ export default function ConversationDetailPage() {
                 </option>
               ))}
             </select>
+            <input
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              placeholder="Motivo de la transferencia"
+              className="input text-sm"
+              aria-label="Motivo de la transferencia"
+            />
+            <button
+              type="button"
+              onClick={() => {
+                if (ownerChoice === '__unassign__') void reassign(null)
+                else if (ownerChoice) void reassign(ownerChoice)
+              }}
+              disabled={busy || !ownerChoice}
+              className="btn-primary text-sm"
+            >
+              Transferir
+            </button>
 
             <select
               value=""
@@ -436,13 +554,15 @@ export default function ConversationDetailPage() {
           </h2>
           <textarea
             value={draft}
-            onChange={(e) => setDraft(e.target.value)}
+            onChange={(e) => updateDraft(e.target.value)}
             rows={3}
             placeholder="Escribe tu respuesta…"
             className="input"
           />
           {sendError && (
-            <p className="mt-2 text-sm text-red-700">{sendError}</p>
+            <p className="mt-2 text-sm text-red-700" aria-live="polite">
+              {sendError}
+            </p>
           )}
           <div className="mt-2 flex justify-end">
             <button

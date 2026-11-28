@@ -275,7 +275,7 @@ El prefijo es `VITE_` porque la web es una SPA de Vite: solo se expone al navega
 pnpm --filter @crm/api db:migrate
 ```
 
-Aplica las 22 migraciones en orden. Es idempotente: volver a correrlo no rompe nada. Si una migración revierte, el ejecutor **detiene la secuencia**, la deja PENDIENTE (no la registra) y sale con código distinto de 0.
+Aplica todas las migraciones de `supabase/migrations/` en orden. Es idempotente: volver a correrlo no rompe nada. Si una migración revierte, el ejecutor **detiene la secuencia**, la deja PENDIENTE (no la registra) y sale con código distinto de 0.
 
 ### 4. Primer usuario
 
@@ -358,17 +358,26 @@ pnpm --filter @crm/api db:migrate                       # esquema del repo, en o
 pnpm --filter @crm/api exec tsx scripts/seed-synthetic.ts   # usuarios y datos sintéticos
 ```
 
-El proyecto anterior queda en **modo consulta** (`apps/*/.env.legacy`): su esquema fue restaurado por la plataforma y conserva 2 cuentas, 3 clientes y 3 tickets, sin conversaciones, mensajes ni adjuntos. `bash scripts/dev/export-legacy-copy.sh` deja una **copia privada** de lo recuperable.
+El proyecto anterior queda en **modo consulta** (`apps/*/.env.legacy`): conserva 2 cuentas, 3 clientes y 3 tickets, sin conversaciones, mensajes ni adjuntos. **La causa del incidente de ese proyecto no está confirmada** (la plataforma comunicó una restauración; eso no prueba quién vació el esquema) — ver `docs/diagnostico-base-compartida.md`. `bash scripts/dev/export-legacy-copy.sh` deja una **copia privada** de lo recuperable.
 
 El **esquema vive fuera de la base**: `supabase/migrations/*.sql` es la fuente de verdad; `public.schema_migrations` es solo contabilidad de lo ya aplicado.
 
 Antes de habilitar datos reales, el validador da el veredicto:
 
 ```bash
-pnpm --filter @crm/api exec tsx scripts/validate-access-controls.ts
+pnpm --filter @crm/api exec tsx scripts/validate-access-controls.ts          # informe
+pnpm --filter @crm/api exec tsx scripts/validate-access-controls.ts --strict # sale con 1 si algo queda PENDIENTE
 ```
 
-Mientras el veredicto diga que el entorno no puede recibir datos reales, **el entorno se mantiene sintético**.
+Mientras el veredicto diga que el entorno no puede recibir datos reales, **el entorno se mantiene sintético**. Última corrida: **6 controles OK, 0 pendientes**.
+
+### Autorización de conversaciones y adjuntos
+
+- Escribir en un chat y transferirlo son operaciones **transaccionales** en la base (`append_outbound_message`, `reassign_conversation`, `take_conversation`): la validación del titular y el guardado ocurren en la misma operación, así que un chat que cambió de manos mientras el agente redactaba **no guarda nada** y la interfaz lo informa (`409 assignment_changed`).
+- Transferir exige **motivo** y **versión vigente** (`{ assigned_agent_id, reason, expected_version }`); una versión obsoleta se rechaza con `409 version_conflict`. El cambio y su bitácora (`conversation_audit_log`) se escriben en la misma transacción.
+- Los adjuntos se autorizan **por adjunto**: titular del ticket, titular del chat del mensaje, o admin/supervisor. Un ticket con evidencia de dos chats muestra toda al titular del ticket y solo la de su chat al agente que atiende ese chat.
+- El archivo lo sirve la **API** (bytes, con `?download=1` para descargar): no hay URL firmada, porque sobrevivía a la pérdida de permiso. El bucket es privado y ya no tiene políticas para `authenticated`.
+- **Desvincular no borra el objeto**: el borrado físico es una operación aparte (`POST /api/tickets/:id/attachments/:messageId/purge`) que exige admin/supervisor, que no quede ninguna referencia viva y que se haya pasado la ventana de conservación (`RETENTION_DAYS`), y deja bitácora en `attachment_purge_log`.
 
 ### Base de datos
 
@@ -421,7 +430,7 @@ apps/
   api/                      # Next.js 16 — App Router bajo src/app
     src/app/api/            # 42 route handlers (tickets, conversations, users,
                             #   roles, themes, categories, webhooks, me, dashboard…)
-    src/app/middleware.ts   # CORS — sin él el SPA ve "Load failed"
+    src/middleware.ts        # CORS — sin él el SPA ve "Load failed"
     src/lib/                # auth.ts, permissions.ts, phone.ts, sanitize.ts,
                             #   validate.ts, twilio-signature.ts, supabase/{server,admin}
     src/services/           # lógica de negocio y queries (tickets, conversations,
@@ -438,7 +447,7 @@ apps/
     src/stores/auth.ts      # Zustand: sesión + keyring de permisos
     src/router.tsx          # createBrowserRouter con future v7_relativeSplatPath
     e2e/                    # Playwright
-supabase/migrations/        # 22 migraciones SQL — el esquema vive aquí (fuera de la base)
+supabase/migrations/        # migraciones SQL — el esquema vive aquí (fuera de la base)
 PRODUCT_SPEC.md             # fuente de verdad del alcance y estado de requisitos
 CLAUDE.md                   # guía de trabajo para agentes y personas
 ```

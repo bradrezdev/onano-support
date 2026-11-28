@@ -38,6 +38,7 @@ class QueryMock {
 
 const mockAdmin: any = {
   from: vi.fn((): QueryMock => new QueryMock()),
+  rpc: vi.fn(),
 }
 
 vi.mock('@/lib/supabase/admin', () => ({
@@ -48,7 +49,12 @@ const conversations = await import('./conversations')
 
 beforeEach(() => {
   mockAdmin.from.mockReset()
+  mockAdmin.rpc.mockReset()
 })
+
+function setNextRpc(payload: Response) {
+  mockAdmin.rpc.mockReturnValueOnce(Promise.resolve(payload))
+}
 
 function setNextFrom(payload: Response): QueryMock {
   const q = new QueryMock()
@@ -119,78 +125,96 @@ describe('listConversations', () => {
 // ---------------------------------------------------------------------------
 
 describe('reassignConversation (W4)', () => {
-  it('refuses an assignee that does not exist', async () => {
-    setNextFrom({ data: null, error: null }) // profiles lookup
-    await expect(
-      conversations.reassignConversation('cv-1', 'ghost', 'sup-1'),
-    ).rejects.toMatchObject({ code: 'assignee_not_found', status: 400 })
-  })
-
-  it('refuses a suspended assignee', async () => {
-    setNextFrom({
-      data: { id: 'u-2', display_name: 'Ana', suspended_at: '2026-01-01', deleted_at: null },
-      error: null,
-    })
-    await expect(
-      conversations.reassignConversation('cv-1', 'u-2', 'sup-1'),
-    ).rejects.toMatchObject({ code: 'assignee_inactive', status: 400 })
-  })
-
-  it('refuses a deleted assignee', async () => {
-    setNextFrom({
-      data: { id: 'u-3', display_name: 'Beto', suspended_at: null, deleted_at: '2026-01-01' },
-      error: null,
-    })
-    await expect(
-      conversations.reassignConversation('cv-1', 'u-3', 'sup-1'),
-    ).rejects.toMatchObject({ code: 'assignee_inactive', status: 400 })
-  })
-
-  it('writes assigned_agent_id for an active assignee', async () => {
-    setNextFrom({
-      data: { id: 'u-1', display_name: 'Caro', suspended_at: null, deleted_at: null },
-      error: null,
-    })
-    const updateQ = setNextFrom({
-      data: {
-        id: 'cv-1',
-        contact_id: 'ct-1',
-        assigned_agent_id: 'u-1',
-        status: 'open',
-        last_message_at: null,
-        last_message_preview: null,
-        unread_count: 0,
-        created_at: '2026-01-01',
-      },
+  it('sends the reason and the expected version to the database', async () => {
+    setNextRpc({
+      data: [
+        {
+          conversation_id: 'cv-1',
+          contact_id: 'ct-1',
+          assigned_agent_id: 'u-1',
+          status: 'open',
+          last_message_at: null,
+          last_message_preview: null,
+          unread_count: 0,
+          created_at: '2026-01-01',
+          assignment_version: 2,
+          previous_assignee_id: 'u-0',
+          changed_at: '2026-01-02',
+        },
+      ],
       error: null,
     })
 
-    const result = await conversations.reassignConversation('cv-1', 'u-1', 'sup-1')
+    const result = await conversations.reassignConversation(
+      'cv-1',
+      'u-1',
+      'sup-1',
+      'el cliente pidió hablar con ventas',
+      1,
+    )
 
-    const upd = updateQ.ops.find((o) => o.op === 'update')
-    expect(upd?.args[0]).toEqual({ assigned_agent_id: 'u-1' })
+    const [fn, args] = mockAdmin.rpc.mock.calls[0]
+    expect(fn).toBe('reassign_conversation')
+    expect(args).toMatchObject({
+      p_conversation_id: 'cv-1',
+      p_actor_id: 'sup-1',
+      p_new_assignee_id: 'u-1',
+      p_reason: 'el cliente pidió hablar con ventas',
+      p_expected_version: 1,
+    })
     expect(result.assigned_agent_id).toBe('u-1')
+    expect(result.assignment_version).toBe(2)
+    // La fila completa viene de la función: nada de campos inventados.
+    expect(result.id).toBe('cv-1')
+    expect(result.contact_id).toBe('ct-1')
+    expect(result.status).toBe('open')
+    expect(result.unread_count).toBe(0)
+    expect(result.created_at).toBe('2026-01-01')
+  })
+
+  it('maps a stale version to 409', async () => {
+    setNextRpc({ data: null, error: { code: 'C0004', message: 'version_conflict' } })
+    await expect(
+      conversations.reassignConversation('cv-1', 'u-1', 'sup-1', 'motivo', 1),
+    ).rejects.toMatchObject({ code: 'version_conflict', status: 409 })
+  })
+
+  it('maps an inactive assignee to 400', async () => {
+    setNextRpc({ data: null, error: { code: 'C0005', message: 'invalid_assignee' } })
+    await expect(
+      conversations.reassignConversation('cv-1', 'ghost', 'sup-1', 'motivo', 1),
+    ).rejects.toMatchObject({ code: 'invalid_assignee', status: 400 })
+  })
+
+  it('maps a missing reason to 400', async () => {
+    setNextRpc({ data: null, error: { code: 'C0001', message: 'reason_required' } })
+    await expect(
+      conversations.reassignConversation('cv-1', 'u-1', 'sup-1', '   ', 1),
+    ).rejects.toMatchObject({ code: 'reason_required', status: 400 })
   })
 
   it('returns the conversation to the queue when assigned_agent_id is null', async () => {
-    const updateQ = setNextFrom({
-      data: {
-        id: 'cv-1',
-        contact_id: 'ct-1',
-        assigned_agent_id: null,
-        status: 'open',
-        last_message_at: null,
-        last_message_preview: null,
-        unread_count: 0,
-        created_at: '2026-01-01',
-      },
+    setNextRpc({
+      data: [
+        {
+          conversation_id: 'cv-1',
+          contact_id: 'ct-1',
+          assigned_agent_id: null,
+          status: 'open',
+          last_message_at: null,
+          last_message_preview: null,
+          unread_count: 0,
+          created_at: '2026-01-01',
+          assignment_version: 3,
+          previous_assignee_id: 'u-1',
+          changed_at: '2026-01-02',
+        },
+      ],
       error: null,
     })
 
-    const result = await conversations.reassignConversation('cv-1', null, 'sup-1')
-    expect(updateQ.ops.find((o) => o.op === 'update')?.args[0]).toEqual({
-      assigned_agent_id: null,
-    })
+    const result = await conversations.reassignConversation('cv-1', null, 'sup-1', 'vuelve a la cola', 2)
+    expect(mockAdmin.rpc.mock.calls[0][1]).toMatchObject({ p_new_assignee_id: null })
     expect(result.assigned_agent_id).toBeNull()
   })
 })
@@ -200,35 +224,45 @@ describe('reassignConversation (W4)', () => {
 // ---------------------------------------------------------------------------
 
 describe('takeConversation', () => {
-  it('claims an unassigned conversation', async () => {
-    const q = setNextFrom({
-      data: {
-        id: 'cv-1',
-        contact_id: 'ct-1',
-        assigned_agent_id: 'sop-1',
-        status: 'open',
-        last_message_at: null,
-        last_message_preview: null,
-        unread_count: 0,
-        created_at: '2026-01-01',
-      },
+  it('claims an unassigned conversation through the guarded function', async () => {
+    setNextRpc({
+      data: [
+        {
+          id: 'cv-1',
+          contact_id: 'ct-1',
+          assigned_agent_id: 'sop-1',
+          status: 'open',
+          last_message_at: null,
+          last_message_preview: null,
+          unread_count: 0,
+          created_at: '2026-01-01',
+          assignment_version: 2,
+        },
+      ],
       error: null,
     })
 
     const result = await conversations.takeConversation('cv-1', 'sop-1')
-    expect(q.ops.find((o) => o.op === 'update')?.args[0]).toEqual({
-      assigned_agent_id: 'sop-1',
-    })
-    // The guard `.is('assigned_agent_id', null)` is what makes this atomic.
-    expect(q.ops.some((o) => o.op === 'is' && o.args[0] === 'assigned_agent_id')).toBe(true)
+    const [fn, args] = mockAdmin.rpc.mock.calls[0]
+    expect(fn).toBe('take_conversation')
+    expect(args).toMatchObject({ p_conversation_id: 'cv-1', p_actor_id: 'sop-1' })
     expect(result.assigned_agent_id).toBe('sop-1')
+    expect(result.assignment_version).toBe(2)
   })
 
   it('returns 409 when somebody else already claimed it', async () => {
-    setNextFrom({ data: null, error: null }) // maybeSingle -> no row matched
+    setNextRpc({ data: null, error: { code: 'C0010', message: 'already_taken' } })
     await expect(conversations.takeConversation('cv-1', 'sop-2')).rejects.toMatchObject({
       code: 'already_taken',
       status: 409,
+    })
+  })
+
+  it('returns 404 when the conversation does not exist (not "already taken")', async () => {
+    setNextRpc({ data: null, error: { code: 'C0003', message: 'conversation_not_found' } })
+    await expect(conversations.takeConversation('cv-ghost', 'sop-2')).rejects.toMatchObject({
+      code: 'conversation_not_found',
+      status: 404,
     })
   })
 })

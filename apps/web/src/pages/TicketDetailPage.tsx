@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams, Link } from 'react-router-dom'
-import { ArrowLeft, AlertTriangle, Calendar, Check, Flag, Inbox, Layers, Paperclip, RotateCcw, Send, Tag, UserSquare } from 'lucide-react'
+import { ArrowLeft, AlertTriangle, Calendar, Check, Download, Eye, Flag, Inbox, Layers, Paperclip, RotateCcw, Send, Tag, UserSquare } from 'lucide-react'
 import { formatDistanceToNow } from 'date-fns'
 import clsx from 'clsx'
 import { api, ApiError } from '@/lib/api'
@@ -40,7 +40,27 @@ interface AttachedMessage {
   direction: 'in' | 'out'
   created_at: string
   note: string | null
+  /**
+   * Whether the pinned message carries a file of its own. The API decides
+   * it, row by row: a message without a file has nothing to preview or to
+   * download, so the interface offers no control for it.
+   */
+  has_file?: boolean
+  filename?: string | null
 }
+
+/**
+ * The state of one attachment's bytes inside the browser.
+ *
+ * The bytes never come from a URL the API signed: the API serves them and
+ * re-checks the permission on every request, so the file only exists here
+ * while the row is open.
+ */
+type AttachmentMedia =
+  | { status: 'loading' }
+  | { status: 'ready'; url: string; contentType: string }
+  | { status: 'no-file' }
+  | { status: 'error' }
 
 interface TicketMessage {
   id: string
@@ -96,7 +116,10 @@ export default function TicketDetailPage() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
   const profile = useAuthStore((s) => s.profile)
-  const isAdmin = profile?.role === 'admin'
+  // El permiso es la verdad: `profiles.role` es la columna legacy. El backend
+  // exige `ticket.close` y `ticket.reopen` respectivamente.
+  const canClose = canWith(profile, 'ticket.close')
+  const canReopen = canWith(profile, 'ticket.reopen')
   const canReply = canWith(profile, 'ticket.reply')
 
   const [ticket, setTicket] = useState<Ticket | null>(null)
@@ -106,6 +129,23 @@ export default function TicketDetailPage() {
   const [messages, setMessages] = useState<TicketMessage[]>([])
   const [linkedConvs, setLinkedConvs] = useState<LinkedConversationSummary[]>([])
   const [attachments, setAttachments] = useState<AttachedMessage[]>([])
+  /**
+   * The bytes of the open attachments, by message id. A row that is not
+   * open has no bytes in the browser at all.
+   */
+  const [media, setMedia] = useState<Record<string, AttachmentMedia>>({})
+  /** Why the evidence panel changed on its own (a 403, a failed download). */
+  const [attachmentNotice, setAttachmentNotice] = useState<string | null>(null)
+  /** The actor lost every right over this ticket: the case is withdrawn. */
+  const [accessLost, setAccessLost] = useState(false)
+  // Every object URL this page created. Revoking them is what keeps a
+  // permission change from leaving a readable file behind in the browser.
+  const objectUrls = useRef<Set<string>>(new Set())
+  // The object URL of each open row, so a row can release just its own.
+  const mediaUrls = useRef<Record<string, string>>({})
+  // Pending revocations of downloaded files (the browser reads the blob
+  // asynchronously, so the URL cannot die in the same tick).
+  const pendingTimers = useRef<Set<number>>(new Set())
   const [draft, setDraft] = useState<unknown>({ type: 'doc', content: [] })
   // Recommendation 10: triage controls (priority / due / major) save inline so
   // the operator does not have to leave the case to flag urgency.
@@ -143,7 +183,21 @@ export default function TicketDetailPage() {
     try {
       const res = await api.get<{ data: Ticket }>(`/api/tickets/${id}`)
       setTicket(res.data)
+      // The ticket is readable: the withdrawal notice does not follow the
+      // operator to the next case.
+      setAccessLost(false)
     } catch (err) {
+      if (err instanceof ApiError && err.status === 403) {
+        // The actor lost every right over the ticket: the cached history of
+        // the case leaves the screen instead of staying readable.
+        setAccessLost(true)
+        setTicket(null)
+        setMessages([])
+        setAttachments([])
+        setLinkedConvs([])
+        releaseAllMedia()
+        return
+      }
       setError((err as ApiError).message)
     } finally {
       setLoading(false)
@@ -168,8 +222,20 @@ export default function TicketDetailPage() {
       // W1: the WhatsApp evidence pinned to this ticket. Non-fatal — a ticket
       // without evidence is normal, not broken.
       const res = await api.get<{ data: AttachedMessage[] }>(`/api/tickets/${id}/attachments`)
+      // The list is re-read: whatever was open belongs to the previous
+      // listing, and its bytes must not survive it.
+      releaseAllMedia()
       setAttachments(res.data)
+      setAttachmentNotice(null)
     } catch (err) {
+      if (err instanceof ApiError && err.status === 403) {
+        // The evidence of this ticket is no longer readable: the cached rows
+        // leave the screen (they are the client's words).
+        releaseAllMedia()
+        setAttachments([])
+        setAttachmentNotice('Ya no puedes ver los adjuntos de este ticket.')
+        return
+      }
       // eslint-disable-next-line no-console
       console.warn('[ticket] loadAttachments failed', err)
     }
@@ -181,6 +247,10 @@ export default function TicketDetailPage() {
       const res = await api.get<{ data: TicketMessage[] }>(`/api/tickets/${id}/messages`)
       setMessages(res.data)
     } catch (err) {
+      if (err instanceof ApiError && err.status === 403) {
+        setMessages([])
+        return
+      }
       // Non-fatal: thread silently empty if backend errors.
       // eslint-disable-next-line no-console
       console.warn('[ticket] loadMessages failed', err)
@@ -193,10 +263,142 @@ export default function TicketDetailPage() {
       const res = await api.get<{ data: LinkedConversationSummary[] }>(`/api/tickets/${id}/conversations`)
       setLinkedConvs(res.data)
     } catch (err) {
+      if (err instanceof ApiError && err.status === 403) {
+        setLinkedConvs([])
+        return
+      }
       // eslint-disable-next-line no-console
       console.warn('[ticket] loadLinkedConversations failed', err)
     }
   }
+
+  /**
+   * Releases the bytes of one row: the object URL dies and the row forgets
+   * them. Called when the row is replaced, when the permission is lost, and
+   * when the list is re-read.
+   */
+  function releaseMedia(messageId: string) {
+    const url = mediaUrls.current[messageId]
+    if (url) {
+      URL.revokeObjectURL(url)
+      objectUrls.current.delete(url)
+      delete mediaUrls.current[messageId]
+    }
+  }
+
+  /** Releases every byte this page holds. */
+  function releaseAllMedia() {
+    for (const messageId of Object.keys(mediaUrls.current)) releaseMedia(messageId)
+    setMedia({})
+  }
+
+  /**
+   * A row the actor can no longer open leaves the list: its text is the
+   * client's words and its bytes are gone.
+   */
+  function dropAttachment(messageId: string) {
+    releaseMedia(messageId)
+    setMedia((prev) => {
+      const next = { ...prev }
+      delete next[messageId]
+      return next
+    })
+    setAttachments((prev) => prev.filter((a) => a.message_id !== messageId))
+  }
+
+  /**
+   * Opens an attachment. The bytes come from the API (the browser never
+   * holds a signed URL that would outlive the permission), so a 403 here
+   * means the actor lost the right to see this specific file.
+   */
+  async function openAttachment(messageId: string) {
+    if (!id) return
+    setAttachmentNotice(null)
+    setMedia((prev) => ({ ...prev, [messageId]: { status: 'loading' } }))
+    try {
+      const file = await api.getRaw(`/api/tickets/${id}/attachments/${messageId}`)
+      releaseMedia(messageId)
+      const url = URL.createObjectURL(file.blob)
+      objectUrls.current.add(url)
+      mediaUrls.current[messageId] = url
+      setMedia((prev) => ({
+        ...prev,
+        [messageId]: { status: 'ready', url, contentType: file.contentType },
+      }))
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 403) {
+        dropAttachment(messageId)
+        setAttachmentNotice('Ese adjunto ya no está disponible para ti.')
+        return
+      }
+      if (err instanceof ApiError && err.status === 404) {
+        if (err.code === 'attachment_file_not_found') {
+          // The message is pinned, but it carries no file (a text-only
+          // message). The row stays: the evidence is still there.
+          setMedia((prev) => ({ ...prev, [messageId]: { status: 'no-file' } }))
+          return
+        }
+        // The message is no longer attached to this ticket: the row leaves.
+        dropAttachment(messageId)
+        setAttachmentNotice('Ese adjunto ya no está disponible para ti.')
+        return
+      }
+      setMedia((prev) => ({ ...prev, [messageId]: { status: 'error' } }))
+      setAttachmentNotice('No se pudo abrir el archivo.')
+    }
+  }
+
+  /**
+   * Downloads an attachment. Same bytes, same authorization check; the API
+   * answers with `Content-Disposition: attachment` when `download=1`.
+   */
+  async function downloadAttachment(messageId: string) {
+    if (!id) return
+    setAttachmentNotice(null)
+    try {
+      const file = await api.getRaw(
+        `/api/tickets/${id}/attachments/${messageId}?download=1`,
+      )
+      const filename = filenameFrom(file.contentDisposition, `adjunto-${messageId}`)
+      const url = URL.createObjectURL(file.blob)
+      objectUrls.current.add(url)
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = filename
+      anchor.rel = 'noopener'
+      document.body.appendChild(anchor)
+      anchor.click()
+      anchor.remove()
+      // The browser reads the blob asynchronously: the URL dies a beat later,
+      // not in the same tick.
+      const timer = window.setTimeout(() => {
+        URL.revokeObjectURL(url)
+        objectUrls.current.delete(url)
+        pendingTimers.current.delete(timer)
+      }, 1000)
+      pendingTimers.current.add(timer)
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 403) {
+        dropAttachment(messageId)
+        setAttachmentNotice('Ese adjunto ya no está disponible para ti.')
+        return
+      }
+      setAttachmentNotice('No se pudo descargar el archivo.')
+    }
+  }
+
+  // Nothing survives the page: every object URL is revoked when the operator
+  // leaves the ticket, so no file stays readable in the browser.
+  useEffect(() => {
+    const urls = objectUrls.current
+    const timers = pendingTimers.current
+    return () => {
+      for (const timer of timers) window.clearTimeout(timer)
+      timers.clear()
+      for (const url of urls) URL.revokeObjectURL(url)
+      urls.clear()
+    }
+  }, [])
 
   useEffect(() => {
     if (id) void loadTicket()
@@ -276,6 +478,17 @@ export default function TicketDetailPage() {
   if (loading) {
     return <div className="card p-6 text-sm text-slate-500">Cargando…</div>
   }
+  if (accessLost) {
+    return (
+      <div
+        className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800"
+        aria-live="polite"
+      >
+        Ya no tienes acceso a este ticket: se retiró el historial de esta
+        pantalla.
+      </div>
+    )
+  }
   if (error) {
     return <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div>
   }
@@ -315,28 +528,32 @@ export default function TicketDetailPage() {
               )}
             </div>
           </div>
-          {isAdmin && (
+          {(canClose || canReopen) && (
             <div className="flex gap-2">
               {!isClosed ? (
-                <button
-                  type="button"
-                  onClick={close}
-                  disabled={busy}
-                  className="btn-ghost text-sm"
-                >
-                  <Check size={14} />
-                  Cerrar
-                </button>
+                canClose && (
+                  <button
+                    type="button"
+                    onClick={close}
+                    disabled={busy}
+                    className="btn-ghost text-sm"
+                  >
+                    <Check size={14} />
+                    Cerrar
+                  </button>
+                )
               ) : (
-                <button
-                  type="button"
-                  onClick={reopen}
-                  disabled={busy}
-                  className="btn-ghost text-sm"
-                >
-                  <RotateCcw size={14} />
-                  Reabrir
-                </button>
+                canReopen && (
+                  <button
+                    type="button"
+                    onClick={reopen}
+                    disabled={busy}
+                    className="btn-ghost text-sm"
+                  >
+                    <RotateCcw size={14} />
+                    Reabrir
+                  </button>
+                )
               )}
             </div>
           )}
@@ -415,6 +632,14 @@ export default function TicketDetailPage() {
             </span>
           )}
         </h2>
+        {attachmentNotice && (
+          <p
+            className="mb-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800"
+            role="status"
+          >
+            {attachmentNotice}
+          </p>
+        )}
         {attachments.length === 0 ? (
           <p className="text-sm text-slate-500">
             Sin mensajes adjuntos. Podés fijarlos desde una conversación con
@@ -422,27 +647,79 @@ export default function TicketDetailPage() {
           </p>
         ) : (
           <ul className="space-y-2">
-            {attachments.map((a) => (
-              <li
-                key={a.message_id}
-                className={clsx(
-                  'rounded border px-3 py-2 text-sm',
-                  a.direction === 'in'
-                    ? 'border-slate-200 bg-slate-50'
-                    : 'border-brand-200 bg-brand-50',
-                )}
-              >
-                <div className="flex items-center justify-between gap-2 text-xs text-slate-500">
-                  <span className="font-medium">
-                    {a.direction === 'in' ? 'Cliente' : 'Nosotros'}
-                  </span>
-                  <span>{formatDistanceToNow(new Date(a.created_at), { addSuffix: true })}</span>
-                </div>
-                <p className="mt-1 whitespace-pre-wrap text-slate-800">
-                  {a.body || '(sin contenido)'}
-                </p>
-              </li>
-            ))}
+            {attachments.map((a, index) => {
+              const rowMedia = media[a.message_id]
+              return (
+                <li
+                  key={a.message_id}
+                  className={clsx(
+                    'rounded border px-3 py-2 text-sm',
+                    a.direction === 'in'
+                      ? 'border-slate-200 bg-slate-50'
+                      : 'border-brand-200 bg-brand-50',
+                  )}
+                >
+                  <div className="flex items-center justify-between gap-2 text-xs text-slate-500">
+                    <span className="font-medium">
+                      {a.direction === 'in' ? 'Cliente' : 'Nosotros'}
+                    </span>
+                    <span>{formatDistanceToNow(new Date(a.created_at), { addSuffix: true })}</span>
+                  </div>
+                  <p className="mt-1 whitespace-pre-wrap text-slate-800">
+                    {a.body || '(sin contenido)'}
+                  </p>
+                  {a.filename && (
+                    <p className="mt-1 truncate text-xs text-slate-500">{a.filename}</p>
+                  )}
+                  {/* The same rule as the listing: the file is opened through
+                      the API, which re-checks the permission on every
+                      request. A 403 withdraws the row. A pinned message
+                      without a file gets no control at all. */}
+                  {a.has_file !== false && (
+                    <div className="mt-2 flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => void openAttachment(a.message_id)}
+                        disabled={rowMedia?.status === 'loading'}
+                        className="btn-ghost text-xs"
+                        aria-label={`Ver el archivo adjunto ${index + 1}`}
+                      >
+                        <Eye size={12} />
+                        Ver
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void downloadAttachment(a.message_id)}
+                        className="btn-ghost text-xs"
+                        aria-label={`Descargar el archivo adjunto ${index + 1}`}
+                      >
+                        <Download size={12} />
+                        Descargar
+                      </button>
+                    </div>
+                  )}
+                  {a.has_file === false && (
+                    <p className="mt-1 text-xs text-slate-400">
+                      Este mensaje no tiene archivo.
+                    </p>
+                  )}
+                  {rowMedia?.status === 'loading' && (
+                    <p className="mt-1 text-xs text-slate-500">Abriendo el archivo…</p>
+                  )}
+                  {rowMedia?.status === 'ready' && (
+                    <AttachmentPreview url={rowMedia.url} contentType={rowMedia.contentType} />
+                  )}
+                  {rowMedia?.status === 'no-file' && (
+                    <p className="mt-1 text-xs text-slate-500">
+                      Ese mensaje no tiene un archivo adjunto.
+                    </p>
+                  )}
+                  {rowMedia?.status === 'error' && (
+                    <p className="mt-1 text-xs text-red-700">No se pudo abrir el archivo.</p>
+                  )}
+                </li>
+              )
+            })}
           </ul>
         )}
       </section>
@@ -692,4 +969,67 @@ function personName(
 function labelFor(v: { name: string } | null | undefined): string {
   if (v) return v.name
   return 'No encontrado'
+}
+
+/**
+ * The preview of an open attachment.
+ *
+ * The bytes come from an object URL the page owns; there is no <img src> to
+ * a signed Storage URL, so nothing here survives the permission.
+ */
+function AttachmentPreview({ url, contentType }: { url: string; contentType: string }) {
+  if (contentType.startsWith('image/')) {
+    return (
+      <img
+        src={url}
+        alt="Vista previa del archivo adjunto"
+        className="mt-2 max-h-64 rounded border border-slate-200"
+      />
+    )
+  }
+  if (contentType.startsWith('audio/')) {
+    return (
+      <audio
+        src={url}
+        controls
+        aria-label="Vista previa del archivo adjunto"
+        className="mt-2"
+      />
+    )
+  }
+  if (contentType.startsWith('video/')) {
+    return (
+      <video
+        src={url}
+        controls
+        aria-label="Vista previa del archivo adjunto"
+        className="mt-2 max-h-64 rounded border border-slate-200"
+      />
+    )
+  }
+  return (
+    <p className="mt-1 text-xs text-slate-500">
+      Este tipo de archivo no se puede previsualizar: usa «Descargar».
+    </p>
+  )
+}
+
+/**
+ * The file name the API sent in `Content-Disposition`, or a readable
+ * fallback. The API is the one that knows the name.
+ */
+function filenameFrom(header: string | null, fallback: string): string {
+  if (!header) return fallback
+  const utf8 = /filename\*=UTF-8''([^;]+)/i.exec(header)
+  const encoded = utf8?.[1]
+  if (encoded) {
+    try {
+      return decodeURIComponent(encoded)
+    } catch {
+      return encoded
+    }
+  }
+  const plain = /filename="?([^";]+)"?/i.exec(header)
+  const name = plain?.[1]
+  return name ? name.trim() : fallback
 }
