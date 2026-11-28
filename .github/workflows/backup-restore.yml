@@ -1,0 +1,169 @@
+name: Backup and restore from disk
+
+on:
+  push:
+    branches: [main]
+  # Sin filtro de rama: el control tiene que correr en CADA PR, también en
+  # los apilados (un PR cuya base es la rama de otro PR).
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backup-restore-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backup-restore:
+    name: Respaldo desde disco con origen desconectado
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: CI=true pnpm install --frozen-lockfile
+
+      - name: Generate API route types
+        run: pnpm --filter @crm/api typegen
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: v2.122.0
+
+      # ------------------------------------------------------------------
+      # 1 · Origen efímero (mismo patrón que ci.yml).
+      # ------------------------------------------------------------------
+      - name: Start ephemeral origin
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/sb-origin/supabase"
+          cp supabase/ci/config.toml "$RUNNER_TEMP/sb-origin/supabase/config.toml"
+          cd "$RUNNER_TEMP/sb-origin"
+          if ! supabase start --exclude studio,imgproxy,edge-runtime,vector,realtime,logflare,mailpit,supavisor > /tmp/sb-origin-start.log 2>&1; then
+            echo "::error::No se pudo levantar la instancia de origen"
+            tail -60 /tmp/sb-origin-start.log
+            exit 1
+          fi
+          supabase status -o env > /tmp/sb-origin-env.sh
+          cd "$GITHUB_WORKSPACE"
+          node scripts/ci/supabase-env.mjs /tmp/sb-origin-env.sh
+
+      - name: Apply migrations on origin
+        run: pnpm --filter @crm/api db:migrate
+
+      # ------------------------------------------------------------------
+      # 2 · Crear el respaldo.
+      # ------------------------------------------------------------------
+      - name: Create backup
+        id: create_backup
+        env:
+          ORIGIN_STACK_DIR: ${{ runner.temp }}/sb-origin
+        run: |
+          set -euo pipefail
+          BACKUP_DIR="$(cd apps/api && pnpm exec tsx scripts/create-backup.ts | tail -n 1)"
+          if [ -z "${BACKUP_DIR}" ] || [ ! -d "${BACKUP_DIR}" ]; then
+            echo "::error::No se pudo crear el respaldo"
+            exit 1
+          fi
+          echo "backup_dir=${BACKUP_DIR}" >> "$GITHUB_OUTPUT"
+          echo "Respaldo creado en ${BACKUP_DIR}"
+
+      # ------------------------------------------------------------------
+      # 3 · Detener el origen para demostrar que la restauración no lo necesita.
+      # ------------------------------------------------------------------
+      - name: Stop origin containers
+        run: |
+          set -euo pipefail
+          ORIGIN_CONTAINERS=(
+            "supabase_db_onano-support-ci"
+            "supabase_rest_onano-support-ci"
+            "supabase_auth_onano-support-ci"
+            "supabase_kong_onano-support-ci"
+            "supabase_storage_onano-support-ci"
+          )
+          docker stop "${ORIGIN_CONTAINERS[@]}" > /dev/null 2>&1 || true
+          sleep 2
+          RUNNING="$(docker ps --format '{{.Names}}' | grep -E '^supabase_(db|rest|auth|kong|storage)_onano-support-ci$' || true)"
+          if [ -n "${RUNNING}" ]; then
+            echo "::error::No se pudo detener el origen: ${RUNNING}"
+            exit 1
+          fi
+          # Prueba de verdad: el origen tiene que ser INALCANZABLE, no solo
+          # tener los contenedores parados. Si el nombre de un contenedor
+          # cambiara, el grep de arriba no lo vería y la demostración sería
+          # falsa; el curl no depende de nombres.
+          ORIGIN_API="$(grep -E '^SUPABASE_URL=' apps/api/.env | head -n 1 | cut -d= -f2- | tr -d '"')"
+          if [ -n "${ORIGIN_API}" ]; then
+            if curl -s -o /dev/null --max-time 5 "${ORIGIN_API}/auth/v1/health"; then
+              echo "::error::El origen sigue respondiendo en ${ORIGIN_API}: la demostración no probaría nada"
+              exit 1
+            fi
+            echo "Origen inaccesible en ${ORIGIN_API} (verificado por curl)."
+          else
+            echo "::error::No se pudo leer SUPABASE_URL del .env del origen"
+            exit 1
+          fi
+          echo "Origen desconectado."
+
+      # ------------------------------------------------------------------
+      # 4 · Restaurar en una segunda instancia con puertos remapeados.
+      #
+      # Nota: levantar dos stacks de Supabase en el mismo runner puede fallar
+      # por conflictos de puertos o recursos. Si el destino no arranca, este
+      # paso falla y el job reporta el problema; no se simula un destino.
+      # ------------------------------------------------------------------
+      - name: Restore from backup
+        id: restore
+        env:
+          RESTORE_STACK_DIR: ${{ runner.temp }}/sb-restore
+        run: |
+          set -euo pipefail
+          cd apps/api
+          pnpm exec tsx scripts/restore-rehearsal.ts --backup "${{ steps.create_backup.outputs.backup_dir }}"
+
+      # ------------------------------------------------------------------
+      # 5 · Reanudar el origen (incluso si la restauración falló).
+      # ------------------------------------------------------------------
+      - name: Restart origin containers
+        if: always()
+        run: |
+          set -euo pipefail
+          ORIGIN_CONTAINERS=(
+            "supabase_db_onano-support-ci"
+            "supabase_rest_onano-support-ci"
+            "supabase_auth_onano-support-ci"
+            "supabase_kong_onano-support-ci"
+            "supabase_storage_onano-support-ci"
+          )
+          docker start "${ORIGIN_CONTAINERS[@]}" > /dev/null 2>&1 || true
+
+      - name: Print registry record
+        if: always()
+        run: |
+          set -euo pipefail
+          REGISTRY="${HOME}/supabase-dev/backups/registry.jsonl"
+          if [ -f "${REGISTRY}" ]; then
+            echo "Último registro:"
+            tail -n 1 "${REGISTRY}"
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Respaldo y restauración desde disco"
+            echo ""
+            echo "backup_dir: \`${{ steps.create_backup.outputs.backup_dir || 'n/d' }}\`"
+            echo "restore_exit: \`${{ steps.restore.outcome }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
